@@ -50,7 +50,8 @@ tm()   { as_user tmux -L "$SOCK" "$@"; }
 pane() { tm capture-pane -J -p -t "$SESSION" 2>/dev/null; }
 
 # --- version gate (warn-only) ---
-AGY_VER="$("$AGY_BIN" --version 2>/dev/null | head -1 | tr -d ' \r' || echo '?')"
+# as_user: don't execute the service user's binary as root (privilege boundary).
+AGY_VER="$(as_user "$AGY_BIN" --version 2>/dev/null | head -1 | tr -d ' \r' || echo '?')"
 case "$AGY_VER" in
   *"$KNOWN_GOOD_AGY"*) : ;;
   *) warn "agy version is '$AGY_VER'; onboarding was verified on $KNOWN_GOOD_AGY. If the"

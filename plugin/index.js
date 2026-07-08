@@ -682,7 +682,14 @@ export default definePluginEntry({
       channel: "telegram",
       namespace: NS,
       handler: async (ctx) => {
-        if (ctx.auth && ctx.auth.isAuthorizedSender === false) return { handled: false };
+        // Fail-closed: only an explicitly authorized sender may drive the panel.
+        // A missing ctx.auth is treated as unauthorized (and logged) rather than
+        // silently allowed — if a framework version stops passing auth context,
+        // buttons go dead with a clear log line instead of opening up to anyone.
+        if (ctx.auth?.isAuthorizedSender !== true) {
+          if (!ctx.auth) api.logger?.warn?.("antigravity: callback arrived without ctx.auth — denying (fail-closed)");
+          return { handled: false };
+        }
         const payload = (ctx.callback?.payload ?? "").trim();
         const defaultModel = await getDefaultModel();
         // Rewrite the tapped message in place; fall back to a fresh reply if the

@@ -48,14 +48,16 @@ denoise() { grep -viE 'Doctor warnings|state-migrations|config-health|Left legac
 
 # 1) Ensure agy is installed for the service user.
 if [ -x "$AGY_BIN" ]; then
-  log "agy present: $AGY_BIN ($("$AGY_BIN" --version 2>/dev/null || echo '?'))"
+  # asu: never execute the service user's binary as root — a compromised
+  # service account must not get code execution in this root script.
+  log "agy present: $AGY_BIN ($(asu "$AGY_BIN" --version 2>/dev/null || echo '?'))"
 else
   log "installing Antigravity CLI (agy) for user '$OPENCLAW_USER' ..."
   asu env PATH=/usr/local/bin:/usr/bin:/bin \
     bash -c 'curl -fsSL https://antigravity.google/cli/install.sh | bash' \
     || die "agy install failed"
   [ -x "$AGY_BIN" ] || die "agy not present at $AGY_BIN after install"
-  log "agy installed: $("$AGY_BIN" --version 2>/dev/null || echo '?')"
+  log "agy installed: $(asu "$AGY_BIN" --version 2>/dev/null || echo '?')"
 fi
 
 # 2) Expose agy on the gateway PATH (plain symlink, no translation).
