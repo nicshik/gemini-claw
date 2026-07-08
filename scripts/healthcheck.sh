@@ -28,7 +28,8 @@ AGY_BIN="$OPENCLAW_HOME/.local/bin/agy"
 asu() { sudo -u "$OPENCLAW_USER" env HOME="$OPENCLAW_HOME" "$@"; }
 
 # 1) agy binary
-if [ -x "$AGY_BIN" ]; then ok "agy present ($("$AGY_BIN" --version 2>/dev/null || echo '?'))"
+# asu: don't execute the service user's binary as root (privilege boundary).
+if [ -x "$AGY_BIN" ]; then ok "agy present ($(asu "$AGY_BIN" --version 2>/dev/null || echo '?'))"
 else bad "agy missing at $AGY_BIN"; fi
 
 # 2) agy on the default system PATH (what the gateway sees)
