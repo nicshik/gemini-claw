@@ -220,6 +220,23 @@ function quotaResetSuffix(reset) {
   return reset ? ` Сброс примерно через ${reset}.` : "";
 }
 
+// Distinguish a TRANSIENT Google-side capacity/availability failure (HTTP 503
+// "MODEL_CAPACITY_EXHAUSTED for gemini-3.1-flash-image" / "Service Unavailable" —
+// the image model is momentarily overloaded on Google's side) from a per-account
+// quota (429 RESOURCE_EXHAUSTED; detectQuotaError). This must be checked FIRST,
+// because "MODEL_CAPACITY_EXHAUSTED" contains "capacity"+"exhausted" and would
+// otherwise trip detectQuotaError and be mislabelled as the user's quota. A 503 is
+// not the user's limit and clears on its own, so it warrants a "try again" message.
+function detectCapacityError(text) {
+  if (!text) return false;
+  return /model[\s_-]*capacity[\s_-]*exhausted/i.test(text)
+    || /\b503\b/.test(text)
+    || /service[\s_-]*unavailable/i.test(text)
+    || /(out of|over[\s-]?)\s*capacity/i.test(text)
+    || /\boverloaded\b|temporarily unavailable/i.test(text)
+    || /(перегруж\w*|временно недоступ\w*)/i.test(text);
+}
+
 // ---- opaque callback encoding ----
 // Navigation buttons are `action.type:"callback"` with value `NS:<payload>`. On
 // the FIRST render (a command reply) the framework encodes them for us. But when
@@ -377,8 +394,13 @@ export default definePluginEntry({
     // commands). Slow == agy's own latency, no LLM on top. ----
     async function doAsk(payload, defaultModel) {
       const r = await runAgy([...modelArgs(defaultModel), "-p", payload], { timeoutMs: 120_000 });
-      const quota = detectQuotaError(r.out || r.err, { strict: true });
-      if (quota) return { text: `🚫 Квота Google на выбранную модель исчерпана.${quotaResetSuffix(quota.reset)}\nПопробуй позже или смени модель в /antigravity model.` };
+      // Only treat output as an error when agy itself failed — a successful answer
+      // may legitimately discuss quotas/capacity without being an error.
+      if (!(r.ok && r.out)) {
+        if (detectCapacityError(r.out || r.err)) return { text: "🕐 Модель Google временно перегружена (503) — это на стороне Google, не твоя квота. Попробуй ещё раз через минуту." };
+        const quota = detectQuotaError(r.out || r.err, { strict: true });
+        if (quota) return { text: `🚫 Квота Google на выбранную модель исчерпана.${quotaResetSuffix(quota.reset)}\nПопробуй позже или смени модель в /antigravity model.` };
+      }
       if (r.ok && r.out) return { text: r.out };
       if (r.timedOut) return { text: "⏳ agy думал слишком долго — попробуй короче или позже." };
       return { text: `Не удалось получить ответ agy.${r.err ? `\n${r.err.slice(0, 400)}` : ""}` };
@@ -400,6 +422,10 @@ export default definePluginEntry({
           return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
         }
       }
+      // No image produced. A 503 (image model overloaded on Google's side) is
+      // transient and NOT the user's quota — check it before detectQuotaError,
+      // whose "capacity exhausted" match would otherwise mislabel it as a quota.
+      if (detectCapacityError(r.out || r.err)) return { text: "🕐 Модель картинок Google (Nano Banana 2 / gemini-3.1-flash-image) временно перегружена (503, MODEL_CAPACITY_EXHAUSTED) — это на стороне Google, а не твоя квота. Попробуй ещё раз через минуту-другую." };
       const quota = detectQuotaError(r.out || r.err);
       if (quota) return { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` };
       if (r.timedOut) return { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." };
