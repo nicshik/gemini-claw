@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# agy-models — model list for the /antigravity panel.
+#
+# Hot path (no args): print the model list INSTANTLY from a cache and never call
+# agy, so the panel can never block on a slow agy. If the cache is missing, print
+# a built-in bootstrap list.
+#
+# Refresh path (--refresh): repopulate the cache from `agy models` (bounded). Run
+# by install.sh once and by a daily systemd timer, so the list self-updates if
+# Google changes the model lineup — without ever blocking the panel.
+#
+#   agy-models            # print the cached model list, one per line (instant)
+#   agy-models --refresh  # refresh the cache from `agy models`
+#
+# Env: GEMINI_AGY_BIN (agy path), AGY_MODELS_CACHE (cache file path)
+set -u
+
+AGY="${GEMINI_AGY_BIN:-$HOME/.local/bin/agy}"
+[ -x "$AGY" ] || AGY="$(command -v agy 2>/dev/null || echo agy)"
+CACHE="${AGY_MODELS_CACHE:-$HOME/.gemini/antigravity-models.txt}"
+BOOTSTRAP='Gemini 3.5 Flash (Medium)
+Gemini 3.5 Flash (High)
+Gemini 3.5 Flash (Low)
+Gemini 3.1 Pro (High)
+Gemini 3.1 Pro (Low)
+Claude Sonnet 4.6 (Thinking)
+Claude Opus 4.6 (Thinking)
+GPT-OSS 120B (Medium)'
+
+mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+
+if [ "${1:-}" = "--refresh" ]; then
+  tmp="$(mktemp "${CACHE}.XXXXXX" 2>/dev/null)" || exit 0
+  # </dev/null is REQUIRED: agy is an interactive agent and will read leftover
+  # stdin as a prompt (hanging / returning an AI answer) if stdin is left open.
+  if cd "$HOME" 2>/dev/null && timeout -s KILL 90 "$AGY" models </dev/null >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv -f "$tmp" "$CACHE"
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# Hot path: pure cache read — never invokes agy, so it is always instant.
+if [ -s "$CACHE" ]; then
+  cat "$CACHE"
+else
+  printf '%s\n' "$BOOTSTRAP"
+fi

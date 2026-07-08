@@ -1,0 +1,6 @@
+# local cruft / backups (secret-scan also rejects tracked *bak* files)
+*.bak
+*.bak-*
+*~
+.DS_Store
+node_modules/

@@ -1,0 +1,42 @@
+name: Preflight
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh bin/agy-models
+
+      - name: Check plugin syntax
+        run: node --check plugin/index.js
+
+      - name: Validate plugin manifest JSON
+        run: |
+          set -euo pipefail
+          node --check plugin/index.js
+          for f in plugin/openclaw.plugin.json plugin/package.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" \
+              && echo "$f: valid JSON"
+          done
+
+      - name: Scan for secrets
+        run: scripts/secret-scan.sh
+
+      - name: Reject tracked backup files
+        run: |
+          set -euo pipefail
+          tracked_backups="$(git ls-files '*bak*')"
+          if [ -n "$tracked_backups" ]; then
+            echo "Tracked backup files are not allowed:"
+            echo "$tracked_backups"
+            exit 1
+          fi

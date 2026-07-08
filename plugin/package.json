@@ -1,0 +1,25 @@
+{
+  "name": "openclaw-plugin-antigravity",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Antigravity (agy) control-panel command plugin for OpenClaw.",
+  "license": "MIT",
+  "author": "nicshik",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicshik/gemini-claw"
+  },
+  "files": [
+    "index.js",
+    "openclaw.plugin.json"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.6.11"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "antigravity",
+  "name": "Antigravity",
+  "description": "Antigravity (agy) control panel: instant inline-button menu for model switch, status, ask, and image generation. Runs as a plugin command so navigation bypasses the LLM agent.",
+  "activation": {
+    "onStartup": true
+  },
+  "enabledByDefault": true,
+  "commandAliases": [
+    {
+      "name": "antigravity",
+      "kind": "runtime-slash"
+    },
+    {
+      "name": "antigravity_ask",
+      "kind": "runtime-slash"
+    },
+    {
+      "name": "antigravity_image",
+      "kind": "runtime-slash"
+    }
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
