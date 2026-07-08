@@ -172,6 +172,6 @@ checkpoint per the hardening convention.
 
 - npm / ClawHub / marketplace publishing (decided against — native install
   copies only the JS; this plugin is inert without agy + OAuth + PATH + cache).
-- "capture-next-message" input flow (blocked by plugin trust tier — see README
-  "Command & rendering model").
+- "capture-next-message" input flow (blocked by plugin trust tier — see
+  `docs/plugin-internals.md` "Command & rendering model").
 - Patching agy or OpenClaw core.
