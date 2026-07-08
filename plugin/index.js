@@ -548,19 +548,21 @@ export default definePluginEntry({
       const p = prompt.replace(/`/g, "'").replace(/\s+/g, " ").trim();
       return `/antigravity_image ${aspect ? `${aspect} ` : ""}${p}`;
     }
-    // Photo reply: caption + Recreate/Edit buttons. The caption is rendered as
-    // markdown on the command-reply AND adapter.sendPayload paths, so the backticked
-    // command is tap-to-copy — that's the primary Edit affordance. Telegram caps
-    // captions at 1024 chars, and buttons only attach to the photo when the whole
-    // text fits as a caption (longer text becomes a follow-up message and the
-    // buttons move off the photo) — so skip the command line rather than overflow.
-    function buildImageReply(prompt, aspect, mediaUrl, id) {
-      let text = `🖼 ${prompt}`;
+    // The caption shown under a generated photo: the tap-to-copy command as a
+    // markdown code span (rendered on the command-reply AND adapter.sendPayload
+    // paths). It doubles as the visible prompt and the primary Edit affordance, so
+    // there's no separate `🖼 <prompt>` label line. Telegram caps captions at 1024
+    // chars and only keeps the buttons on the photo when the text fits as a caption
+    // (longer text becomes a buttonless follow-up message), so truncate rather than
+    // overflow.
+    function imageCaption(prompt, aspect) {
       const cmd = imageCommandFor(prompt, aspect);
-      if (text.length + cmd.length + 8 <= 1000) text += `\n\n\`${cmd}\``;
-      else if (text.length > 1000) text = `${text.slice(0, 999)}…`;
+      return cmd.length + 2 <= 1000 ? `\`${cmd}\`` : `\`${cmd.slice(0, 997)}…\``;
+    }
+    // Photo reply: caption + Recreate/Edit buttons.
+    function buildImageReply(prompt, aspect, mediaUrl, id) {
       return {
-        text,
+        text: imageCaption(prompt, aspect),
         mediaUrl,
         presentation: {
           blocks: [{
@@ -620,9 +622,9 @@ export default definePluginEntry({
               api.logger?.warn?.(`antigravity: could not store image prompt: ${e}`);
               return null;
             });
-            // If the store write failed, fall back to a plain photo (no buttons —
-            // they'd dangle on a missing id).
-            return id ? buildImageReply(payload, aspect, mediaUrl, id) : { text: `🖼 ${payload}`, mediaUrl };
+            // If the store write failed, fall back to the same command caption but
+            // no buttons (they'd dangle on a missing id).
+            return id ? buildImageReply(payload, aspect, mediaUrl, id) : { text: imageCaption(payload, aspect), mediaUrl };
           } catch (e) {
             api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
             return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
