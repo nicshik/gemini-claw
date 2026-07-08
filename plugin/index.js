@@ -17,7 +17,7 @@
 
 import { definePluginEntry } from "openclaw/plugin-sdk/core";
 import { spawn } from "node:child_process";
-import { copyFile, unlink, readFile, writeFile, mkdir, readdir, stat } from "node:fs/promises";
+import { copyFile, unlink, readFile, writeFile, mkdir, readdir, rename, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -36,6 +36,17 @@ const OUTBOUND_IMAGE_KEEP = Math.max(1, Number(process.env.ANTIGRAVITY_IMAGE_KEE
 // in the agy config dir — outside the git-synced workspace, so it never dirties
 // a sync. Same file the earlier skill used, so state carries over.
 const STATE_FILE = path.join(GEMINI_DIR, "antigravity-skill.json");
+// Prompt store for the Recreate/Edit buttons under generated images. Telegram
+// callback_data is capped at 64 bytes, so the full prompt can never ride in the
+// button — we store it here under a short id and put only `rc:<id>`/`ed:<id>`
+// in the callback. Plain JSON file for the same trust-level reason as STATE_FILE.
+const IMAGE_STORE_FILE = path.join(GEMINI_DIR, "antigravity-image-prompts.json");
+const IMAGE_STORE_KEEP = 100;
+
+// AspectRatio values accepted by agy's generate_image tool (verified against the
+// binary's tool schema). The plugin can't pass tool args directly — the value is
+// injected as an instruction in the prompt text and the model fills the tool param.
+const ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"];
 
 // Last-resort model list if the cache helper has not populated a list yet.
 // The live list comes from `agy-models` (cached, self-refreshing daily).
@@ -169,6 +180,65 @@ async function pruneOutboundImages() {
   }
 }
 
+// ---- image prompt store (Recreate/Edit buttons) ----
+// Store mutations are serialized through a promise chain: the background
+// Recreate flow made saveImagePrompt genuinely concurrent with the foreground
+// command path, and an unserialized read-modify-write would drop the losing
+// entry (its buttons would then dead-end on "кнопка устарела").
+let imageStoreLock = Promise.resolve();
+function withImageStore(fn) {
+  const run = imageStoreLock.then(fn, fn);
+  imageStoreLock = run.then(() => {}, () => {});
+  return run;
+}
+async function readImageStore() {
+  try {
+    const obj = JSON.parse(await readFile(IMAGE_STORE_FILE, "utf8"));
+    return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : {};
+  } catch { return {}; }
+}
+async function writeImageStore(store) {
+  const ids = Object.keys(store);
+  if (ids.length > IMAGE_STORE_KEEP) {
+    ids.sort((a, b) => (store[a]?.ts || 0) - (store[b]?.ts || 0));
+    for (const id of ids.slice(0, ids.length - IMAGE_STORE_KEEP)) delete store[id];
+  }
+  await mkdir(GEMINI_DIR, { recursive: true });
+  // tmp + rename: a crash mid-write must not leave invalid JSON (readImageStore
+  // would silently return {} and orphan every existing button).
+  const tmp = `${IMAGE_STORE_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(store));
+  await rename(tmp, IMAGE_STORE_FILE);
+}
+async function saveImagePrompt(prompt, aspect) {
+  return withImageStore(async () => {
+    const store = await readImageStore();
+    let id;
+    do { id = Math.random().toString(36).slice(2, 8); } while (store[id]);
+    store[id] = { p: prompt, ...(aspect ? { ar: aspect } : {}), ts: Date.now() };
+    await writeImageStore(store);
+    return id;
+  });
+}
+async function getImagePrompt(id) {
+  if (!/^[a-z0-9]{1,12}$/.test(id || "")) return null;
+  const store = await readImageStore();
+  const entry = store[id];
+  return entry && typeof entry.p === "string" ? entry : null;
+}
+
+// Inline aspect prefix: `/antigravity_image 16:9 закат` — first token is applied
+// as a one-off ratio when it matches the known list, otherwise it's just prompt text.
+function parseAspectPrefix(payload) {
+  const trimmed = (payload || "").trim();
+  // A bare ratio with no prompt must fall into the "show hint" branch (empty
+  // rest), not become a multi-minute generation of the literal text "16:9".
+  if (ASPECT_RATIOS.includes(trimmed)) return { aspect: trimmed, rest: "" };
+  const m = trimmed.match(/^(\d{1,2}:\d{1,2})\s+(\S[\s\S]*)$/);
+  if (m && ASPECT_RATIOS.includes(m[1])) return { aspect: m[1], rest: m[2].trim() };
+  return { aspect: null, rest: trimmed };
+}
+
 // Detect a Google "quota exhausted" (HTTP 429 RESOURCE_EXHAUSTED) response in
 // agy's output and pull out the reset window it mentions, so we can show a clear
 // message instead of a raw error. Antigravity meters quota per-model, and image
@@ -290,6 +360,21 @@ function menuMain(defaultModel, { withCommands = true } = {}) {
     text: withCommands ? head + commands : head,
     rows: [
       [{ label: "Модель", value: "models" }, { label: "Статус", value: "status" }],
+      [{ label: "Формат картинок", value: "aspect" }],
+    ],
+  };
+}
+// Aspect-ratio picker. Tap sets the persistent default for /antigravity_image;
+// "авто" clears it (agy's own default, 1:1). All values fit callback_data easily.
+function menuAspect(currentAspect) {
+  const mark = (v) => `${currentAspect === v ? "• " : ""}${v}`;
+  return {
+    text: `Формат картинок (соотношение сторон)${currentAspect ? ` — текущий: ${currentAspect}` : " — сейчас: авто"}.\nРазово: /antigravity_image 16:9 текст запроса`,
+    rows: [
+      [{ label: mark("1:1"), value: "ar:1:1" }, { label: mark("3:2"), value: "ar:3:2" }, { label: mark("2:3"), value: "ar:2:3" }],
+      [{ label: mark("16:9"), value: "ar:16:9" }, { label: mark("9:16"), value: "ar:9:16" }],
+      [{ label: mark("4:3"), value: "ar:4:3" }, { label: mark("3:4"), value: "ar:3:4" }],
+      [{ label: `${currentAspect ? "" : "• "}авто`, value: "ar:auto" }, { label: "‹ Назад", value: "menu" }],
     ],
   };
 }
@@ -313,8 +398,8 @@ function menuBack(text) {
   return { text, rows: [[{ label: "‹ Назад", value: "menu" }]] };
 }
 
-function statusText(defaultModel) {
-  return `Модель по умолчанию: ${defaultModel || "agy (без явного выбора)"}`;
+function statusText(defaultModel, imageAspect) {
+  return `Модель по умолчанию: ${defaultModel || "agy (без явного выбора)"}\nФормат картинок: ${imageAspect || "авто"}`;
 }
 
 // Shown when a command arrives with no argument (bare `/antigravity_ask`, the
@@ -331,9 +416,9 @@ function statusText(defaultModel) {
 // - *_HINT: plain fallback for the edit-in-place (button) path, where the raw
 //   editMessage text is not markdown-rendered, so backticks would show literally.
 const ASK_HINT = "✍️ Введите вопрос: /antigravity_ask текст вопроса";
-const IMAGE_HINT = "🖼 Введите запрос на генерацию изображения: /antigravity_image текст запроса";
+const IMAGE_HINT = "🖼 Введите запрос на генерацию изображения: /antigravity_image текст запроса (формат — первым словом: /antigravity_image 16:9 текст)";
 const ASK_HINT_MD = "✍️ Введите вопрос: `/antigravity_ask` текст вопроса";
-const IMAGE_HINT_MD = "🖼 Введите запрос на генерацию изображения: `/antigravity_image` текст запроса";
+const IMAGE_HINT_MD = "🖼 Введите запрос на генерацию изображения: `/antigravity_image` текст запроса\nФормат — первым словом: `/antigravity_image 16:9` текст запроса";
 
 // ---- renderers ----
 // Command reply (first render): the framework encodes `type:"callback"` -> tgcb1.
@@ -378,24 +463,28 @@ export default definePluginEntry({
   name: "Antigravity",
   description: "Antigravity (agy) control panel: model switch, status, ask, image — instant inline buttons (edit-in-place).",
   register(api) {
-    async function getDefaultModel() {
+    async function getStateValue(key) {
       try {
         const obj = JSON.parse(await readFile(STATE_FILE, "utf8"));
-        return obj && typeof obj.default_model === "string" ? obj.default_model : null;
+        return obj && typeof obj[key] === "string" ? obj[key] : null;
       } catch { return null; }
     }
-    async function setDefaultModel(model) {
+    async function setStateValue(key, value) {
       let obj = {};
       try { obj = JSON.parse(await readFile(STATE_FILE, "utf8")) || {}; } catch { /* new file */ }
-      if (model) obj.default_model = model;
-      else delete obj.default_model;
+      if (value) obj[key] = value;
+      else delete obj[key];
       try {
         await mkdir(GEMINI_DIR, { recursive: true });
         await writeFile(STATE_FILE, JSON.stringify(obj, null, 2));
       } catch (e) {
-        api.logger?.warn?.(`antigravity: could not persist default model: ${e}`);
+        api.logger?.warn?.(`antigravity: could not persist ${key}: ${e}`);
       }
     }
+    const getDefaultModel = () => getStateValue("default_model");
+    const setDefaultModel = (m) => setStateValue("default_model", m);
+    const getImageAspect = () => getStateValue("image_aspect");
+    const setImageAspect = (v) => setStateValue("image_aspect", v);
     function modelArgs(defaultModel) {
       return defaultModel ? ["--model", defaultModel] : [];
     }
@@ -417,11 +506,67 @@ export default definePluginEntry({
       return { text: `Не удалось получить ответ agy.${r.err ? `\n${r.err.slice(0, 400)}` : ""}` };
     }
 
-    async function doImage(payload, defaultModel) {
+    // Full copyable command for a stored prompt (used in captions and the Edit
+    // flow). Backticks in the prompt would terminate the markdown code span the
+    // command is displayed in (truncating what tap-to-copy yields), so the
+    // DISPLAYED command swaps them for apostrophes and collapses newlines; the
+    // stored prompt stays raw for Recreate.
+    function imageCommandFor(prompt, aspect) {
+      const p = prompt.replace(/`/g, "'").replace(/\s+/g, " ").trim();
+      return `/antigravity_image ${aspect ? `${aspect} ` : ""}${p}`;
+    }
+    // Photo reply: caption + Recreate/Edit buttons. The caption is rendered as
+    // markdown on the command-reply AND adapter.sendPayload paths, so the backticked
+    // command is tap-to-copy — that's the primary Edit affordance. Telegram caps
+    // captions at 1024 chars, and buttons only attach to the photo when the whole
+    // text fits as a caption (longer text becomes a follow-up message and the
+    // buttons move off the photo) — so skip the command line rather than overflow.
+    function buildImageReply(prompt, aspect, mediaUrl, id) {
+      let text = `🖼 ${prompt}`;
+      const cmd = imageCommandFor(prompt, aspect);
+      if (text.length + cmd.length + 8 <= 1000) text += `\n\n\`${cmd}\``;
+      else if (text.length > 1000) text = `${text.slice(0, 999)}…`;
+      return {
+        text,
+        mediaUrl,
+        presentation: {
+          blocks: [{
+            type: "buttons",
+            buttons: [
+              { label: "🔁 Ещё раз", action: { type: "callback", value: `${NS}:rc:${id}` } },
+              { label: "✏️ Изменить", action: { type: "callback", value: `${NS}:ed:${id}` } },
+            ],
+          }],
+        },
+      };
+    }
+
+    // All image generations are serialized through one promise chain. Two
+    // overlapping runs would race newestBrainImage over the shared brain tree
+    // and could deliver run A's picture under run B's caption/buttons; the
+    // queue also keeps repeated Recreate taps from spawning parallel agy
+    // processes. startMs is captured inside doImage after the prior run ends,
+    // so windows never overlap.
+    let imageQueue = Promise.resolve();
+    let imageQueueDepth = 0;
+    function doImageQueued(payload, defaultModel, aspect) {
+      imageQueueDepth += 1;
+      const run = imageQueue
+        .then(() => doImage(payload, defaultModel, aspect))
+        .finally(() => { imageQueueDepth -= 1; });
+      imageQueue = run.then(() => {}, () => {});
+      return run;
+    }
+
+    async function doImage(payload, defaultModel, aspect) {
       // Strip leading markdown noise so a stray `*`/`_`/`#` doesn't make the model
       // return an empty response without calling the tool (see sanitizeImageSubject).
       const subject = sanitizeImageSubject(payload);
-      const prompt = `Use your generate_image tool to create an image: ${subject}. Save it as an artifact.`;
+      // The plugin can't pass tool args to agy, so the ratio rides as a prompt
+      // instruction — the reasoning model copies it into generate_image's
+      // AspectRatio parameter (its only supported values are ASPECT_RATIOS).
+      const aspectClause = aspect ? ` Set the AspectRatio parameter of generate_image to "${aspect}".` : "";
+      const prompt = `Use your generate_image tool to create an image: ${subject}.${aspectClause} Save it as an artifact.`;
       // The reasoning model is flaky at actually invoking generate_image (verified:
       // ~1/3 of clean prompts still return an empty response with no image). That
       // failure comes back FAST (no generation happened, no capacity spent), so
@@ -437,7 +582,14 @@ export default definePluginEntry({
         const img = await newestBrainImage(startMs);
         if (img) {
           try {
-            return { text: `🖼 ${payload}`, mediaUrl: await publishBrainImage(img) };
+            const mediaUrl = await publishBrainImage(img);
+            const id = await saveImagePrompt(payload, aspect).catch((e) => {
+              api.logger?.warn?.(`antigravity: could not store image prompt: ${e}`);
+              return null;
+            });
+            // If the store write failed, fall back to a plain photo (no buttons —
+            // they'd dangle on a missing id).
+            return id ? buildImageReply(payload, aspect, mediaUrl, id) : { text: `🖼 ${payload}`, mediaUrl };
           } catch (e) {
             api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
             return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
@@ -455,6 +607,35 @@ export default definePluginEntry({
         api.logger?.info?.(`antigravity: image attempt ${attempt} produced no image; retrying`);
       }
       return { text: "Не получилось сгенерировать картинку (модель не вызвала генератор). Попробуй ещё раз или упрости запрос — иногда помогает смена модели в /antigravity model." };
+    }
+
+    // ---- outbound adapter: the only way to deliver MEDIA (or markdown) from an
+    // interactive handler. ctx.respond.reply/editMessage are text-only and plain;
+    // the handler's return value is discarded beyond `.handled`. The telegram
+    // ChannelOutboundAdapter's sendPayload runs the full delivery pipeline:
+    // markdown→HTML caption, photo upload, presentation buttons attached to the
+    // photo (opaque tgcb1: callback encoding included). Verified against the
+    // OpenClaw dist on prod (outbound-adapter / delivery / send modules). ----
+    async function sendPayloadToChat(ctx, reply) {
+      try {
+        const adapter = await api.runtime?.channel?.outbound?.loadAdapter?.("telegram");
+        if (!adapter?.sendPayload) return false;
+        const cfg = api.runtime?.config?.current?.();
+        const to = String(ctx.callback?.chatId ?? "");
+        if (!cfg || !to) return false;
+        await adapter.sendPayload({
+          cfg,
+          to,
+          text: reply.text ?? "",
+          accountId: ctx.accountId ?? undefined,
+          threadId: ctx.threadId ?? undefined,
+          payload: reply,
+        });
+        return true;
+      } catch (e) {
+        api.logger?.warn?.(`antigravity: outbound adapter send failed: ${e?.message || e}`);
+        return false;
+      }
     }
 
     // ---- edit-in-place navigation for button taps ----
@@ -479,6 +660,59 @@ export default definePluginEntry({
 
         if (payload === "models") {
           await show(await menuModels(defaultModel));
+        } else if (payload === "aspect") {
+          await show(menuAspect(await getImageAspect()));
+        } else if (payload.startsWith("ar:")) {
+          const value = payload.slice(3);
+          if (value === "auto") {
+            await setImageAspect(null);
+            await show(menuMainNote(defaultModel, "✅ Формат картинок: авто"));
+          } else if (ASPECT_RATIOS.includes(value)) {
+            await setImageAspect(value);
+            await show(menuMainNote(defaultModel, `✅ Формат картинок: ${value}`));
+          } else {
+            await show(menuAspect(await getImageAspect()));
+          }
+        } else if (payload.startsWith("rc:") || payload.startsWith("ed:")) {
+          const id = payload.slice(3);
+          const entry = await getImagePrompt(id);
+          if (!entry) {
+            try { await ctx.respond.reply({ text: "Кнопка устарела (запрос уже вычищен из истории) — отправь команду заново." }); } catch { /* ignore */ }
+            return { handled: true };
+          }
+          const aspect = entry.ar || null;
+          if (payload.startsWith("ed:")) {
+            // Edit: hand the user the exact command to tweak. adapter.sendPayload
+            // renders markdown -> the backticked command is tap-to-copy; if the
+            // adapter is unavailable, fall back to plain respond.reply (copyable
+            // via long-press, just not one-tap).
+            const cmd = imageCommandFor(entry.p, aspect);
+            const sent = await sendPayloadToChat(ctx, { text: `✏️ Скопируй, поправь и отправь:\n\`${cmd}\`` });
+            if (!sent) {
+              try { await ctx.respond.reply({ text: `✏️ Скопируй, поправь и отправь:\n${cmd}` }); } catch { /* ignore */ }
+            }
+          } else {
+            // Recreate: ack instantly, generate in the background (up to ~3.5 min —
+            // must not block the callback dispatch), deliver the new photo via the
+            // outbound adapter (respond.* can't send media). Cap the queue so
+            // impatient repeated taps don't stack an hour of generations.
+            if (imageQueueDepth >= 2) {
+              try { await ctx.respond.reply({ text: "⏳ Уже генерирую — дождись текущей картинки." }); } catch { /* ignore */ }
+              return { handled: true };
+            }
+            try { await ctx.respond.reply({ text: `🎨 Генерирую заново${aspect ? ` (${aspect})` : ""}…` }); } catch { /* ignore */ }
+            const model = defaultModel;
+            (async () => {
+              const reply = await doImageQueued(entry.p, model, aspect);
+              const sent = await sendPayloadToChat(ctx, reply);
+              if (!sent) {
+                const note = reply.mediaUrl
+                  ? "Картинка сгенерирована, но не удалось отправить её из кнопки — отправь команду заново."
+                  : plainText(reply.text || "Не получилось сгенерировать картинку.");
+                try { await ctx.respond.reply({ text: note }); } catch { /* ignore */ }
+              }
+            })().catch((e) => api.logger?.error?.(`antigravity: recreate failed: ${e?.message || e}`));
+          }
         } else if (payload.startsWith("m:")) {
           const name = payload.slice(2);
           const models = await readModels();
@@ -490,7 +724,7 @@ export default definePluginEntry({
             await show(menuMainNote(defaultModel, `Не знаю модель "${name}".`));
           }
         } else if (payload === "status") {
-          await show(menuBack(statusText(defaultModel)));
+          await show(menuBack(statusText(defaultModel, await getImageAspect())));
         } else if (payload === "ask") {
           await show(menuBack(ASK_HINT));
         } else if (payload === "image") {
@@ -542,7 +776,17 @@ export default definePluginEntry({
         }
 
         if (sub === "status") {
-          return asReply(menuBack(statusText(defaultModel)));
+          return asReply(menuBack(statusText(defaultModel, await getImageAspect())));
+        }
+
+        if (sub === "aspect") {
+          if (!payload) return asReply(menuAspect(await getImageAspect()));
+          const value = payload.toLowerCase() === "auto" || payload.toLowerCase() === "авто" ? null : payload;
+          if (value && !ASPECT_RATIOS.includes(value)) {
+            return asReply({ ...menuAspect(await getImageAspect()), text: `Не знаю формат "${payload}". Выбери из списка:` });
+          }
+          await setImageAspect(value);
+          return asReply(menuMainNote(defaultModel, `✅ Формат картинок: ${value || "авто"}`));
         }
 
         // ---- agy-backed actions (slow == agy's own latency, no LLM on top) ----
@@ -560,7 +804,9 @@ export default definePluginEntry({
 
         if (sub === "image") {
           if (!payload) return asHintReply(IMAGE_HINT_MD);
-          return doImage(payload, defaultModel);
+          const { aspect: inlineAspect, rest } = parseAspectPrefix(payload);
+          if (!rest) return asHintReply(IMAGE_HINT_MD);
+          return doImageQueued(rest, defaultModel, inlineAspect ?? await getImageAspect());
         }
 
         if (sub === "continue") {
@@ -601,7 +847,9 @@ export default definePluginEntry({
         const payload = (ctx.args ?? "").trim();
         const defaultModel = await getDefaultModel();
         if (!payload) return asHintReply(IMAGE_HINT_MD);
-        return doImage(payload, defaultModel);
+        const { aspect: inlineAspect, rest } = parseAspectPrefix(payload);
+        if (!rest) return asHintReply(IMAGE_HINT_MD);
+        return doImageQueued(rest, defaultModel, inlineAspect ?? await getImageAspect());
       },
     });
 
