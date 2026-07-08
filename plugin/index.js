@@ -237,6 +237,17 @@ function detectCapacityError(text) {
     || /(перегруж\w*|временно недоступ\w*)/i.test(text);
 }
 
+// The reasoning model that fronts the generate_image tool (esp. GPT-OSS) treats a
+// leading markdown emphasis/heading char as formatting and often returns an empty
+// response WITHOUT calling the tool — verified on prod: a subject starting with `*`
+// failed ~100% of the time vs ~33% for the same text without it. Strip leading
+// markdown noise so the subject reads as plain prose. Keep the original if stripping
+// would empty it.
+function sanitizeImageSubject(s) {
+  const stripped = (s || "").replace(/^[\s*_~`#>]+/, "").trim();
+  return stripped || (s || "").trim();
+}
+
 // ---- opaque callback encoding ----
 // Navigation buttons are `action.type:"callback"` with value `NS:<payload>`. On
 // the FIRST render (a command reply) the framework encodes them for us. But when
@@ -407,29 +418,43 @@ export default definePluginEntry({
     }
 
     async function doImage(payload, defaultModel) {
-      const prompt = `Use your generate_image tool to create an image: ${payload}. Save it as an artifact.`;
-      // Only accept an image produced by THIS run: capture a start time (with a
-      // small clock-granularity margin) and ignore anything older, so a
-      // failed/no-op generation can't resend a stale image under the new caption.
-      const startMs = Date.now() - 2000;
-      const r = await runAgy([...modelArgs(defaultModel), "--print-timeout", "3m", "-p", prompt], { timeoutMs: 210_000 });
-      const img = await newestBrainImage(startMs);
-      if (img) {
-        try {
-          return { text: `🖼 ${payload}`, mediaUrl: await publishBrainImage(img) };
-        } catch (e) {
-          api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
-          return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
+      // Strip leading markdown noise so a stray `*`/`_`/`#` doesn't make the model
+      // return an empty response without calling the tool (see sanitizeImageSubject).
+      const subject = sanitizeImageSubject(payload);
+      const prompt = `Use your generate_image tool to create an image: ${subject}. Save it as an artifact.`;
+      // The reasoning model is flaky at actually invoking generate_image (verified:
+      // ~1/3 of clean prompts still return an empty response with no image). That
+      // failure comes back FAST (no generation happened, no capacity spent), so
+      // retry a few times — only on that "no image, not a real Google-side error"
+      // case. Real conditions (capacity/quota/timeout) return immediately.
+      let r;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        // Only accept an image produced by THIS attempt: capture a start time (with
+        // a small clock-granularity margin) and ignore anything older, so a
+        // failed/no-op generation can't resend a stale image under the new caption.
+        const startMs = Date.now() - 2000;
+        r = await runAgy([...modelArgs(defaultModel), "--print-timeout", "3m", "-p", prompt], { timeoutMs: 210_000 });
+        const img = await newestBrainImage(startMs);
+        if (img) {
+          try {
+            return { text: `🖼 ${payload}`, mediaUrl: await publishBrainImage(img) };
+          } catch (e) {
+            api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
+            return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
+          }
         }
+        // Real Google-side / timeout conditions: report, don't retry.
+        // A 503 (image model overloaded on Google's side) is transient and NOT the
+        // user's quota — check it before detectQuotaError, whose "capacity exhausted"
+        // match would otherwise mislabel it as a quota.
+        if (detectCapacityError(r.out || r.err)) return { text: "🕐 Модель картинок Google (Nano Banana 2 / gemini-3.1-flash-image) временно перегружена (503, MODEL_CAPACITY_EXHAUSTED) — это на стороне Google, а не твоя квота. Попробуй ещё раз через минуту-другую." };
+        const quota = detectQuotaError(r.out || r.err);
+        if (quota) return { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` };
+        if (r.timedOut) return { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." };
+        // else: empty response / model didn't call the tool -> retry.
+        api.logger?.info?.(`antigravity: image attempt ${attempt} produced no image; retrying`);
       }
-      // No image produced. A 503 (image model overloaded on Google's side) is
-      // transient and NOT the user's quota — check it before detectQuotaError,
-      // whose "capacity exhausted" match would otherwise mislabel it as a quota.
-      if (detectCapacityError(r.out || r.err)) return { text: "🕐 Модель картинок Google (Nano Banana 2 / gemini-3.1-flash-image) временно перегружена (503, MODEL_CAPACITY_EXHAUSTED) — это на стороне Google, а не твоя квота. Попробуй ещё раз через минуту-другую." };
-      const quota = detectQuotaError(r.out || r.err);
-      if (quota) return { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` };
-      if (r.timedOut) return { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." };
-      return { text: `Картинку получить не удалось.${r.out ? `\n${r.out.slice(0, 400)}` : ""}${r.err ? `\n${r.err.slice(0, 200)}` : ""}` };
+      return { text: "Не получилось сгенерировать картинку (модель не вызвала генератор). Попробуй ещё раз или упрости запрос — иногда помогает смена модели в /antigravity model." };
     }
 
     // ---- edit-in-place navigation for button taps ----
