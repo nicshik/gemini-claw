@@ -9,6 +9,9 @@
 #    which renders the /antigravity control panel natively — navigation bypasses
 #    the LLM agent, so it is instant and immune to a slow/flaky model backend.
 #    The plugin lives under the service user's home and survives `openclaw update`.
+# 4b. Installs two agent-facing *skills* (antigravity_ask, antigravity_image) into the
+#    OpenClaw workspace, giving the LLM agent an EXPLICIT route to agy (additive to the
+#    plugin, which the agent cannot invoke). Explicit-invocation only.
 # 5. Removes the superseded legacy pieces (gemini->agy shim, old `antigravity`
 #    agent skill).
 #
@@ -149,6 +152,71 @@ if asu "$OPENCLAW_BIN" plugins list 2>/dev/null | grep -iE 'antigravity' | grep 
   log "plugin 'antigravity' installed and enabled"
 else
   die "plugin installed on disk but not enabled — check 'openclaw plugins inspect antigravity'"
+fi
+
+# 4b) Install/refresh the antigravity agent skills (antigravity_ask, antigravity_image).
+#     These give the LLM agent an EXPLICIT route to agy, complementing the /antigravity
+#     plugin (which bypasses the agent). Deployed into the OpenClaw workspace skills/bin
+#     dirs, mirroring the other workspace skills (antic, firecrawl_web, ...). Additive
+#     and best-effort: a skill-deploy hiccup must never fail the (already-done) plugin
+#     install, so this block runs with errexit relaxed.
+SKILLS_SRC="$REPO_ROOT/skills"
+WORKSPACE_DIR="$OPENCLAW_HOME/.openclaw/workspace"
+if [ -d "$SKILLS_SRC" ] && [ -d "$WORKSPACE_DIR" ]; then
+  log "installing agent skills (antigravity_ask, antigravity_image) ..."
+  set +e
+  # Stage where the service user can read (the repo may live under /root, which the
+  # openclaw user cannot traverse) — same trick as the plugin stage above. Trap-clean
+  # the stage so an interrupt mid-block does not leak it.
+  SKILL_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/gemini-claw-skills.XXXXXX")"
+  [ -n "$SKILL_STAGE" ] && trap 'rm -rf "$SKILL_STAGE"' EXIT
+  if [ -n "$SKILL_STAGE" ] && [ -d "$SKILL_STAGE" ]; then
+    cp -r "$SKILLS_SRC/." "$SKILL_STAGE"/
+    chown -R "$OPENCLAW_USER":"$OPENCLAW_USER" "$SKILL_STAGE" 2>/dev/null
+    chmod -R go-rwx "$SKILL_STAGE" 2>/dev/null
+  fi
+  # The service user must be able to traverse AND read the stage; chowning the leaf is
+  # not enough if a root-owned TMPDIR parent (e.g. libpam-tmpdir) blocks traversal. An
+  # unreadable stage must NOT reach the destructive swap below.
+  if [ -n "$SKILL_STAGE" ] && [ -d "$SKILL_STAGE" ] && asu test -r "$SKILL_STAGE/README.md"; then
+    asu mkdir -p "$WORKSPACE_DIR/skills" "$WORKSPACE_DIR/bin"
+    for skill in antigravity_ask antigravity_image; do
+      [ -d "$SKILL_STAGE/$skill" ] || continue
+      # Atomic swap: build the new copy alongside, then replace. Never remove the
+      # working skill before the fresh copy is confirmed on disk.
+      asu rm -rf "$WORKSPACE_DIR/skills/.$skill.new"
+      if asu cp -r "$SKILL_STAGE/$skill" "$WORKSPACE_DIR/skills/.$skill.new"; then
+        asu find "$WORKSPACE_DIR/skills/.$skill.new/scripts" -type f -name '*.py' -exec chmod 0755 {} + 2>/dev/null
+        asu rm -rf "$WORKSPACE_DIR/skills/$skill"
+        asu mv "$WORKSPACE_DIR/skills/.$skill.new" "$WORKSPACE_DIR/skills/$skill"
+      else
+        log "WARNING: could not stage skill '$skill'; leaving any existing copy untouched"
+        asu rm -rf "$WORKSPACE_DIR/skills/.$skill.new"
+      fi
+    done
+    for w in antigravity-ask antigravity-image; do
+      [ -f "$SKILL_STAGE/bin/$w" ] || continue
+      asu cp "$SKILL_STAGE/bin/$w" "$WORKSPACE_DIR/bin/$w" && asu chmod 0755 "$WORKSPACE_DIR/bin/$w"
+    done
+    # Verify the result actually landed on disk. Do NOT trust `openclaw skills list`:
+    # on a live gateway it won't reflect new skills until restart, so it cannot tell a
+    # genuine copy failure apart from a refresh delay (the plugin block above likewise
+    # verifies on disk with cmp rather than trusting a list command).
+    if asu test -f "$WORKSPACE_DIR/skills/antigravity_image/scripts/gen.py" \
+       && asu test -f "$WORKSPACE_DIR/skills/antigravity_ask/scripts/ask.py" \
+       && asu test -x "$WORKSPACE_DIR/bin/antigravity-image" \
+       && asu test -x "$WORKSPACE_DIR/bin/antigravity-ask"; then
+      log "agent skills installed: antigravity_ask, antigravity_image (visible after gateway restart)"
+    else
+      log "WARNING: agent-skill deploy did not fully land — check $WORKSPACE_DIR/skills and $WORKSPACE_DIR/bin"
+    fi
+  else
+    log "skill stage unusable/unreadable by $OPENCLAW_USER (TMPDIR traversal?); skipping agent-skill install"
+  fi
+  [ -n "$SKILL_STAGE" ] && rm -rf "$SKILL_STAGE"; trap - EXIT
+  set -e
+else
+  log "workspace ($WORKSPACE_DIR) or skills source missing; skipping agent-skill install"
 fi
 
 # 5) Report auth state (does NOT log in; use scripts/login.sh for that).

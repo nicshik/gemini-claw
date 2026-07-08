@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper for the antigravity_ask skill. Installed into the OpenClaw workspace
+# `bin/` dir; self-locates the skill script at ../skills/antigravity_ask/scripts/ask.py.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$HERE/../skills/antigravity_ask/scripts/ask.py" "$@"
