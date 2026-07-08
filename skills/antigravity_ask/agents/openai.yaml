@@ -1,0 +1,8 @@
+interface:
+  display_name: "Antigravity Ask"
+  short_description: "Ask Antigravity (agy / Gemini) a question on Google AI Pro quota"
+  default_prompt: "Use $antigravity_ask to route a text question through Antigravity (agy / Gemini) when Nick explicitly asks for it."
+
+policy:
+  # Explicit-invocation only: never auto-select this over answering normally.
+  allow_implicit_invocation: false

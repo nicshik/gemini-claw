@@ -1,0 +1,8 @@
+interface:
+  display_name: "Antigravity Image"
+  short_description: "Generate images via Antigravity (agy / Nano Banana 2) on Google AI Pro quota"
+  default_prompt: "Use $antigravity_image to generate image(s) through Antigravity (agy / Gemini Nano Banana 2) when Nick explicitly asks for agy/Gemini image generation."
+
+policy:
+  # Explicit-invocation only: never auto-select this over the built-in imagegen skill.
+  allow_implicit_invocation: false

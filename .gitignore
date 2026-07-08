@@ -4,3 +4,7 @@
 *~
 .DS_Store
 node_modules/
+
+# Python bytecode from skill scripts
+__pycache__/
+*.pyc
