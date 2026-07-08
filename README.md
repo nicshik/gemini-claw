@@ -367,6 +367,14 @@ lost, `git checkout v1.1-hardened && sudo RESTART_GATEWAY=1 scripts/install.sh`
 rebuilds the panel from a known-good state (only the one-time `scripts/login.sh`
 OAuth is host-local).
 
+**Access model.** `/antigravity_ask` (and `ask`/`image` in the panel) hands the
+sender's text verbatim to the `agy` agent, which runs under the service user with
+its own tools (file writes in its brain/workspace, artifact creation). The plugin
+adds no access control of its own beyond OpenClaw's sender authorization — the
+button handler is fail-closed, and commands are gated by OpenClaw. So keep the
+bot's allowed senders restricted (e.g. `dmPolicy` / pairing): anyone who may
+message the bot can drive an agent on your server and spend your AI Pro quota.
+
 ## Configuration (env)
 
 | Var | Default | Meaning |

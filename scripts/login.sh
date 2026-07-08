@@ -31,7 +31,7 @@ OPENCLAW_USER="${OPENCLAW_USER:-openclaw}"
 # agy version the onboarding automation was verified against. A mismatch is only a
 # warning — the URL/code exchange is version-agnostic; only the TUI key-walk is
 # version-coupled, and the seed makes it a no-op on the happy path.
-KNOWN_GOOD_AGY="1.0.16"
+KNOWN_GOOD_AGY="1.1.0"
 
 id "$OPENCLAW_USER" >/dev/null 2>&1 || die "user '$OPENCLAW_USER' not found"
 OPENCLAW_HOME="$(getent passwd "$OPENCLAW_USER" | cut -d: -f6)"
