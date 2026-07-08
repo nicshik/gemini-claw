@@ -6,6 +6,8 @@
 Install the **Antigravity CLI (`agy`)** on an OpenClaw server and register an
 `antigravity` **control-panel plugin** for it — under a Google **AI Pro** session.
 
+🇷🇺 [Читать на русском](README.ru.md)
+
 > **TL;DR** — on the OpenClaw host, one line as root:
 > `curl -fsSL https://raw.githubusercontent.com/nicshik/gemini-claw/main/scripts/bootstrap.sh | sudo bash`
 > — fetches the repo and runs the whole setup (deps → preflight → install → login
@@ -460,8 +462,8 @@ CI (`.github/workflows/preflight.yml`) gates every push: `bash -n` on all script
 and `bin/agy-models`, `node --check plugin/index.js`, JSON-validates the plugin
 manifests, runs `scripts/secret-scan.sh`, and rejects tracked `*bak*` files. No
 credentials live in the repo — the AI Pro OAuth token stays in the service user's
-home on each host. The `v1.0-hardened` tag is the recovery checkpoint: if a host is
-lost, `git checkout v1.0-hardened && sudo RESTART_GATEWAY=1 scripts/install.sh`
+home on each host. The `v1.1-hardened` tag is the recovery checkpoint: if a host is
+lost, `git checkout v1.1-hardened && sudo RESTART_GATEWAY=1 scripts/install.sh`
 rebuilds the panel from a known-good state (only the one-time `scripts/login.sh`
 OAuth is host-local).
 
