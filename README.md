@@ -68,6 +68,19 @@ once (below).
 - `/antigravity_image <описание>` — generates an image (`generate_image` / Nano
   Banana 2) and returns it as a photo. Subcommand form `/antigravity image <описание>`
   also works.
+  - **Aspect ratio**: one-off as the first word — `/antigravity_image 16:9 закат
+    над морем` (accepted: `1:1 2:3 3:2 3:4 4:3 9:16 16:9`), or a persistent
+    default via **Формат картинок** in the panel (`/antigravity aspect [значение|auto]`).
+    The plugin can't pass tool args to `agy`, so the ratio rides as a prompt
+    instruction and the reasoning model fills `generate_image`'s `AspectRatio`
+    parameter (verified live: `16:9` → 1376×768).
+  - **Under every photo**: two inline buttons. **🔁 Ещё раз** regenerates with the
+    same prompt + ratio and posts a new photo; **✏️ Изменить** sends the full
+    command as tap-to-copy monospace so you can tweak and resend. The caption
+    itself also carries the tap-to-copy command (kept ≤1024 chars so the buttons
+    stay attached to the photo). Prompts are stored by short id in
+    `~/.gemini/antigravity-image-prompts.json` (callback_data is capped at 64
+    bytes; newest 100 kept), so buttons on very old photos may expire.
 - `/antigravity ping` — quick auth probe. `/antigravity reset` — clear default model.
 
 Navigation is edit-in-place: tapping a button rewrites the same panel message
@@ -108,8 +121,23 @@ decision.**
 
 Verified in the OpenClaw runtime: the interactive Telegram `respond` exposes only
 `reply` / `editMessage` / `editButtons` / `clearButtons` / `deleteMessage`, and all
-send plain text. So **a button tap can never render a monospace/tap-to-copy
-command.** Only a real command reply can.
+send plain text. So **via `respond.*` a button tap can never render a
+monospace/tap-to-copy command.** Only a real command reply can.
+
+**Escape hatch (used by the image Recreate/Edit buttons): the channel outbound
+adapter.** A plugin can send a NEW message — with markdown rendering and media —
+from inside an interactive handler via
+`api.runtime.channel.outbound.loadAdapter("telegram")` → `adapter.sendPayload({
+cfg: api.runtime.config.current(), to: ctx.callback.chatId, accountId, threadId,
+text, payload })`. `sendPayload` runs the full delivery pipeline: markdown→HTML,
+photo upload from `mediaUrl`, and `presentation.blocks` buttons attached to the
+photo (with the same opaque `tgcb1:` callback encoding, so taps route back to
+this plugin's namespace handler). The handler's *return value* is still discarded
+beyond `.handled`, and `respond.*` stays text-only — the adapter is the only
+media/markdown path from a tap. Photo captions render markdown too (backticks →
+tap-to-copy `code`), but only while the whole text fits Telegram's 1024-char
+caption cap; longer text becomes a follow-up message and the buttons detach from
+the photo.
 
 Consequences baked into the plugin:
 
