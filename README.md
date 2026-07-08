@@ -55,13 +55,16 @@ For users, everything lives in Telegram — no setup on their side. Send
 `/antigravity_image <описание>` to generate an image. The operator installs it
 once (below).
 
-- `/antigravity` — main menu: **Модель · Статус** buttons, plus the two action
-  commands printed in the body as tap-to-copy monospace (`/antigravity_ask` /
-  `/antigravity_image`). They live in the body text, not as buttons — see
-  [Command & rendering model](#command--rendering-model) for why.
+- `/antigravity` — main menu: **Модель · Статус · Формат картинок** buttons, plus
+  the two action commands printed in the body as tap-to-copy monospace
+  (`/antigravity_ask` / `/antigravity_image`). They live in the body text, not as
+  buttons — see [Command & rendering model](#command--rendering-model) for why.
 - **Модель** → pick from the live model list (current marked `•`); the choice is
   the default `--model` for later `ask`/`image` calls.
-- **Статус** → the current default model.
+- **Статус** → the current default model and image aspect ratio.
+- **Формат картинок** → pick the persistent default aspect ratio for
+  `/antigravity_image` (current marked `•`; «авто» clears it). Stored in the same
+  state file as the model choice, survives restarts, until changed.
 - `/antigravity_ask <вопрос>` — one-shot prompt, returns the answer. Sent with no
   argument, it replies with a monospace, tap-to-copy hint. The subcommand form
   `/antigravity ask <вопрос>` also works.
@@ -375,6 +378,14 @@ model) still has plenty of quota left. The plugin detects this and shows a short
 message (with the reset window if `agy` returns one) instead of the raw error, and
 never sends a stale image on failure.
 
+Caveat seen on prod (2026-07-08): on a 429/503 the reasoning model sometimes
+"handles" the error itself — schedules its own retry timer, writes a status
+artifact — and returns an **empty** answer, so there is nothing in `agy`'s stdout
+to detect. When an attempt produces no image and no output, the plugin therefore
+also scans the brain transcripts touched by that run for `RESOURCE_EXHAUSTED`/`429`
+and `MODEL_CAPACITY_EXHAUSTED`/`503` markers and reports the real cause immediately
+instead of burning the remaining retries on "модель не вызвала генератор".
+
 On Google AI Pro the quota refreshes on a ~5-hour rolling window under a weekly cap;
 Google does not publish the image bucket's exact size or reset window, so the
 "resets in ~N" figure comes live from the backend. This is a quota limit, not a
@@ -402,6 +413,10 @@ plugin/openclaw.plugin.json plugin manifest (id, command aliases, activation)
                            aliases: antigravity, antigravity_ask, antigravity_image
 plugin/package.json        openclaw.extensions -> ./index.js (no build step)
 bin/agy-models             cached, self-refreshing model list for the panel
+
+State on the server (service user's home, survives updates):
+~/.gemini/antigravity-skill.json          default model + default image aspect ratio
+~/.gemini/antigravity-image-prompts.json  prompt store for Recreate/Edit buttons (newest 100)
 scripts/bootstrap.sh       curl | sudo bash entrypoint: fetch repo + run setup.sh
 scripts/setup.sh           one-command orchestrator: deps->preflight->install->login->buttons->restart->healthcheck
 scripts/preflight.sh       read-only env checks (root, openclaw version, user, tmux, network, disk, buttons)
