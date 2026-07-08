@@ -227,6 +227,39 @@ async function getImagePrompt(id) {
   return entry && typeof entry.p === "string" ? entry : null;
 }
 
+// When generate_image hits a Google-side error (429 quota / 503 capacity), the
+// reasoning model sometimes "handles" it itself — schedules a retry timer, writes
+// a status artifact — and returns an EMPTY answer instead of relaying the error
+// (seen on prod 2026-07-08: three silent attempts on an exhausted image quota).
+// agy's stdout then carries nothing to detect, but the brain transcript does.
+// Scan transcripts touched by THIS run for the structured error markers.
+async function detectBrainError(minMtimeMs) {
+  const found = { quota: false, capacity: false };
+  async function scan(dir, depth) {
+    if (depth > 4) return;
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (ent.name === ".git") continue;
+        await scan(full, depth + 1);
+      } else if (ent.name === "transcript.jsonl") {
+        try {
+          const st = await stat(full);
+          if (st.mtimeMs < minMtimeMs) continue;
+          const text = await readFile(full, "utf8");
+          const tail = text.length > 65536 ? text.slice(-65536) : text;
+          if (/RESOURCE_EXHAUSTED|\b429\b/i.test(tail)) found.quota = true;
+          if (/MODEL_CAPACITY_EXHAUSTED|\b503\b/i.test(tail)) found.capacity = true;
+        } catch { /* ignore */ }
+      }
+    }
+  }
+  await scan(BRAIN_DIR, 0);
+  return found.quota || found.capacity ? found : null;
+}
+
 // Inline aspect prefix: `/antigravity_image 16:9 закат` — first token is applied
 // as a one-off ratio when it matches the known list, otherwise it's just prompt text.
 function parseAspectPrefix(payload) {
@@ -603,7 +636,13 @@ export default definePluginEntry({
         const quota = detectQuotaError(r.out || r.err);
         if (quota) return { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` };
         if (r.timedOut) return { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." };
-        // else: empty response / model didn't call the tool -> retry.
+        // Empty stdout can hide a Google-side error the model "handled" silently
+        // (retry timers + status artifact instead of relaying the failure). Check
+        // this run's brain transcript before burning the remaining attempts.
+        const brainErr = await detectBrainError(startMs).catch(() => null);
+        if (brainErr?.quota) return { text: "🚫 Квота Google на генерацию картинок исчерпана (429 RESOURCE_EXHAUSTED — видно в журнале agy). Обычно сброс в течение ~15 минут — попробуй позже.\nКартинки идут по отдельной квоте (модель Nano Banana 2), /antigravity ask работает как обычно." };
+        if (brainErr?.capacity) return { text: "🕐 Модель картинок Google временно перегружена (503) — это на стороне Google, не твоя квота. Попробуй ещё раз через минуту-другую." };
+        // else: model genuinely didn't call the tool -> retry.
         api.logger?.info?.(`antigravity: image attempt ${attempt} produced no image; retrying`);
       }
       return { text: "Не получилось сгенерировать картинку (модель не вызвала генератор). Попробуй ещё раз или упрости запрос — иногда помогает смена модели в /antigravity model." };
