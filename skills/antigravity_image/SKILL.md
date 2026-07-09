@@ -61,6 +61,22 @@ For EACH `IMAGE:` line, send that file to the user as a photo/attachment. The fi
 under the workspace `outputs/` root (an allowed outbound-media root), so they can be
 attached directly. Also tell the user how many of the requested variants succeeded.
 
+**A result is ONLY a fresh `IMAGE:` line from the current run.** Send exactly the files
+this invocation printed as `IMAGE:` lines, and nothing else:
+
+- If the run printed no `IMAGE:` line (or exited non-zero), the generation did **not**
+  happen. Say so plainly ("не выполнено, нового изображения нет"), give the reason the
+  wrapper reported (quota 429 / overload 503 / the model never called the generator), and
+  attach nothing. Do not soften a failure into a success.
+- Never re-send an image from an earlier request, from chat history, or from an inbound
+  attachment as if it were a new result or a reference — the wrapper already guarantees
+  every `IMAGE:` path did not exist before this run, so if there is no such line there is
+  no new image to send.
+- Match the count and aspect the user asked for **this time**. Don't carry over a previous
+  request's parameters (e.g. answering "5 variants" when the user now asked for 2).
+- Before delivering, confirm the file actually came from this run — the wrapper's fresh-path
+  attribution does this for you, so trust the `IMAGE:` lines and do not substitute anything.
+
 ## Timing & reliability
 
 - ~60-90 seconds per image; `-n 5` runs serially ≈ 5-8 minutes. Tell the user it's
@@ -71,6 +87,25 @@ attached directly. Also tell the user how many of the requested variants succeed
 - If Google is overloaded (503) or the image quota is exhausted (429), the wrapper
   produces no image and exits non-zero; relay that it's a Google-side condition, not a
   bug. Image quota is separate from text models.
+
+## Quota & limits — do not invent numbers
+
+If the user asks how many images are left, how many were used, or what the exact daily
+limit is, do NOT fabricate a figure or present a mechanism as fact. State only what is
+actually known:
+
+- Image quota is separate from and metered independently of the text models.
+- Google does not publish the exact bucket size or reset window for this route, and there
+  is no live counter / "fuel gauge" to read.
+- The only authoritative signal is agy's own `429 RESOURCE_EXHAUSTED`, which sometimes
+  carries a reset window ("resets in ~N"). Relay exactly that and nothing more.
+
+Do NOT claim a specific number (e.g. "100/day"), and do NOT explain it as a "developer API
+vs web app" split or backend-specific throttling — auth is Nick's Google AI Pro
+subscription over OAuth, not a separate API key. If asked how many were generated today,
+there is no quota gauge to answer that; past attempts live only in the local brain
+transcripts, which is not a limit readout. See the repo README "Image quota" section for
+the sourced details.
 
 ## Notes
 
