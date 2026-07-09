@@ -33,6 +33,23 @@ The wrapper prints agy's answer to stdout; relay it to the user. If Google is
 overloaded (503) or the quota is exhausted (429), the wrapper exits non-zero with a
 short reason on stderr — pass that along rather than treating it as a bug.
 
+## Quota & limits — do not invent numbers
+
+When the user asks about Antigravity/agy usage limits (how many images or requests are
+left, the exact daily cap, why a `429` fired), do NOT fabricate a figure or state a
+mechanism as fact. Known-true only:
+
+- The image model has its own quota bucket, separate from the text/reasoning models, so
+  image and text limits are exhausted independently.
+- Google does not publish the exact bucket size or reset window, and there is no live
+  counter to read; the only authoritative signal is agy's own `429 RESOURCE_EXHAUSTED`
+  (with a reset window when it returns one) — relay exactly that.
+- Do NOT claim a specific number (e.g. "100/day") and do NOT explain it as a "developer
+  API vs web app" split or backend throttling — auth is Nick's Google AI Pro subscription
+  over OAuth, not a separate API key.
+
+See the repo README "Image quota" section for the sourced details.
+
 ## Notes
 
 - No secrets: agy authenticates via Google OAuth (run the host's `scripts/login.sh` once).

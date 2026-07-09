@@ -304,7 +304,12 @@ retries on "the model never called the generator".
 
 On Google AI Pro the quota refreshes on a ~5-hour rolling window under a weekly cap;
 Google does not publish the image bucket's exact size or reset window, so the
-"resets in ~N" figure comes live from the backend. This is a quota limit, not a
+"resets in ~N" figure comes live from the backend. It is **not** a fixed "100 images/day",
+and it is **not** a separate "developer API" quota distinct from the web app — auth is the
+same Google AI Pro account over OAuth, and the image model has its own quota bucket,
+separate from the text/reasoning models. There is no live counter to read,
+so treat any specific number as unverified unless it is the reset window from `agy`'s own
+`429`. This is a quota limit, not a
 geo-block (a region block would be HTTP `403`, and the EU/US are supported regions).
 Sources: `ai.google.dev/gemini-api/docs/{rate-limits,image-generation}`,
 `antigravity.google/docs/plans`, `blog.google` (Nano Banana 2 / Antigravity rate limits).
