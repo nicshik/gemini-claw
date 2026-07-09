@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Thin wrapper for the antigravity_image skill. Installed into the OpenClaw workspace
-# `bin/` dir; self-locates the skill script at ../skills/antigravity_image/scripts/gen.py.
+# Thin wrapper for the antigravity_image skill. Resolves the script in the deployed
+# layout (workspace/bin/../skills/<name>/...) and, as a fallback, the repo layout
+# (skills/bin/../<name>/...) so it also runs from a checkout.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$HERE/../skills/antigravity_image/scripts/gen.py" "$@"
+for cand in \
+  "$HERE/../skills/antigravity_image/scripts/gen.py" \
+  "$HERE/../antigravity_image/scripts/gen.py"; do
+  [ -f "$cand" ] && exec python3 "$cand" "$@"
+done
+echo "antigravity-image: skill script not found near $HERE" >&2
+exit 127
