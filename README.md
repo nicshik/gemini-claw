@@ -153,7 +153,7 @@ single stage):
 
 ```bash
 sudo scripts/preflight.sh                     # read-only env checks, fail fast
-sudo scripts/install.sh                       # agy + PATH symlink + antigravity plugin
+sudo scripts/install.sh                       # agy + PATH symlink + antigravity plugin + agent skills
 sudo scripts/login.sh                         # one-time Google AI Pro OAuth (needs a browser)
 openclaw config set channels.telegram.capabilities.inlineButtons dm
 sudo RESTART_GATEWAY=1 scripts/install.sh     # restart the gateway to load the plugin
@@ -341,7 +341,7 @@ State on the server (service user's home, survives updates):
 scripts/bootstrap.sh       curl | sudo bash entrypoint: fetch repo + run setup.sh
 scripts/setup.sh           one-command orchestrator: deps->preflight->install->login->buttons->restart->healthcheck
 scripts/preflight.sh       read-only env checks (root, openclaw version, user, tmux, network, disk, buttons)
-scripts/install.sh         idempotent: agy + PATH symlink + plugin install
+scripts/install.sh         idempotent: agy + PATH symlink + plugin install + agent skills (antigravity_ask, antigravity_image)
 scripts/login.sh           one-time Google AI Pro OAuth via tmux (seeds onboarding config; walk is fallback)
 scripts/healthcheck.sh     end-to-end verification, non-zero exit on failure
 scripts/uninstall.sh       remove plugin + symlink + helper (--purge also removes agy)
