@@ -165,23 +165,27 @@ WORKSPACE_DIR="$OPENCLAW_HOME/.openclaw/workspace"
 if [ -d "$SKILLS_SRC" ] && [ -d "$WORKSPACE_DIR" ]; then
   log "installing agent skills (antigravity_ask, antigravity_image) ..."
   set +e
+  skills_ok=1
   # Stage where the service user can read (the repo may live under /root, which the
   # openclaw user cannot traverse) — same trick as the plugin stage above. Trap-clean
   # the stage so an interrupt mid-block does not leak it.
   SKILL_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/gemini-claw-skills.XXXXXX")"
-  [ -n "$SKILL_STAGE" ] && trap 'rm -rf "$SKILL_STAGE"' EXIT
   if [ -n "$SKILL_STAGE" ] && [ -d "$SKILL_STAGE" ]; then
+    trap 'rm -rf "$SKILL_STAGE"' EXIT
     cp -r "$SKILLS_SRC/." "$SKILL_STAGE"/
     chown -R "$OPENCLAW_USER":"$OPENCLAW_USER" "$SKILL_STAGE" 2>/dev/null
     chmod -R go-rwx "$SKILL_STAGE" 2>/dev/null
+  else
+    skills_ok=0
   fi
   # The service user must be able to traverse AND read the stage; chowning the leaf is
-  # not enough if a root-owned TMPDIR parent (e.g. libpam-tmpdir) blocks traversal. An
-  # unreadable stage must NOT reach the destructive swap below.
-  if [ -n "$SKILL_STAGE" ] && [ -d "$SKILL_STAGE" ] && asu test -r "$SKILL_STAGE/README.md"; then
+  # not enough if a root-owned TMPDIR parent (e.g. libpam-tmpdir) blocks traversal.
+  # Probe an actually-DEPLOYED file (not a doc that could be renamed) so a readable
+  # stage is never misjudged. An unreadable stage must NOT reach the destructive swap.
+  if [ "$skills_ok" = 1 ] && asu test -r "$SKILL_STAGE/antigravity_ask/SKILL.md"; then
     asu mkdir -p "$WORKSPACE_DIR/skills" "$WORKSPACE_DIR/bin"
     for skill in antigravity_ask antigravity_image; do
-      [ -d "$SKILL_STAGE/$skill" ] || continue
+      [ -d "$SKILL_STAGE/$skill" ] || { skills_ok=0; continue; }
       # Atomic swap: build the new copy alongside, then replace. Never remove the
       # working skill before the fresh copy is confirmed on disk.
       asu rm -rf "$WORKSPACE_DIR/skills/.$skill.new"
@@ -192,20 +196,28 @@ if [ -d "$SKILLS_SRC" ] && [ -d "$WORKSPACE_DIR" ]; then
       else
         log "WARNING: could not stage skill '$skill'; leaving any existing copy untouched"
         asu rm -rf "$WORKSPACE_DIR/skills/.$skill.new"
+        skills_ok=0
       fi
     done
     for w in antigravity-ask antigravity-image; do
-      [ -f "$SKILL_STAGE/bin/$w" ] || continue
-      asu cp "$SKILL_STAGE/bin/$w" "$WORKSPACE_DIR/bin/$w" && asu chmod 0755 "$WORKSPACE_DIR/bin/$w"
+      [ -f "$SKILL_STAGE/bin/$w" ] || { skills_ok=0; continue; }
+      if asu cp "$SKILL_STAGE/bin/$w" "$WORKSPACE_DIR/bin/$w"; then
+        asu chmod 0755 "$WORKSPACE_DIR/bin/$w"
+      else
+        log "WARNING: could not install wrapper '$w'"
+        skills_ok=0
+      fi
     done
-    # Verify the result actually landed on disk. Do NOT trust `openclaw skills list`:
-    # on a live gateway it won't reflect new skills until restart, so it cannot tell a
-    # genuine copy failure apart from a refresh delay (the plugin block above likewise
-    # verifies on disk with cmp rather than trusting a list command).
-    if asu test -f "$WORKSPACE_DIR/skills/antigravity_image/scripts/gen.py" \
-       && asu test -f "$WORKSPACE_DIR/skills/antigravity_ask/scripts/ask.py" \
-       && asu test -x "$WORKSPACE_DIR/bin/antigravity-image" \
-       && asu test -x "$WORKSPACE_DIR/bin/antigravity-ask"; then
+    # Verify by CONTENT, not mere existence — mirrors the plugin block's cmp so a stale
+    # prior install (old files left in place by a failed copy) cannot read as success.
+    for f in antigravity_ask/scripts/ask.py antigravity_image/scripts/gen.py; do
+      asu cmp -s "$SKILL_STAGE/$f" "$WORKSPACE_DIR/skills/$f" || skills_ok=0
+    done
+    for w in antigravity-ask antigravity-image; do
+      asu cmp -s "$SKILL_STAGE/bin/$w" "$WORKSPACE_DIR/bin/$w" || skills_ok=0
+      asu test -x "$WORKSPACE_DIR/bin/$w" || skills_ok=0
+    done
+    if [ "$skills_ok" = 1 ]; then
       log "agent skills installed: antigravity_ask, antigravity_image (visible after gateway restart)"
     else
       log "WARNING: agent-skill deploy did not fully land — check $WORKSPACE_DIR/skills and $WORKSPACE_DIR/bin"

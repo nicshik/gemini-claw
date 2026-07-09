@@ -39,12 +39,10 @@ skills/
 
 `scripts/install.sh` deploys these into the service user's OpenClaw workspace
 (`~/.openclaw/workspace/skills/` + `~/.openclaw/workspace/bin/`) alongside the plugin, and
-restarts the gateway when run with `RESTART_GATEWAY=1`. The image wrapper's logic mirrors
-the plugin's proven path: run agy → find the fresh image in agy's brain tree (attributed
-by "a path that did not exist before this agy call", so a failed variant never re-emits
-an earlier one) → copy it into `workspace/outputs/antigravity-skill-images` (its own
-subdir under the allowed outbound-media root, so the plugin's prune never reaps an
-undelivered skill image) → print the path for the agent to attach.
+restarts the gateway when run with `RESTART_GATEWAY=1`. Each skill's behavior (usage,
+image attribution, retry/error handling, output location) is documented in its own
+`SKILL.md` and script — this README is just the index; SKILL.md is the source of truth.
+The image path mirrors the `/antigravity` plugin's proven pipeline.
 
 No secrets: agy authenticates via Google OAuth (`scripts/login.sh`).
 
