@@ -46,14 +46,42 @@ from inside an interactive handler via
 `api.runtime.channel.outbound.loadAdapter("telegram")` → `adapter.sendPayload({
 cfg: api.runtime.config.current(), to: ctx.callback.chatId, accountId, threadId,
 text, payload })`. `sendPayload` runs the full delivery pipeline: markdown→HTML,
-photo upload from `mediaUrl`, and `presentation.blocks` buttons attached to the
-photo (with the same opaque `tgcb1:` callback encoding, so taps route back to
-this plugin's namespace handler). The handler's *return value* is still discarded
-beyond `.handled`, and `respond.*` stays text-only — the adapter is the only
-media/markdown path from a tap. Photo captions render markdown too (backticks →
-tap-to-copy `code`), but only while the whole text fits Telegram's 1024-char
+photo upload from `mediaUrl`/`mediaUrls` (plural = separate sendPhoto messages,
+caption and keyboard on the FIRST one only). The handler's *return value* is still
+discarded beyond `.handled`, and `respond.*` stays text-only — the adapter is the
+only media/markdown path from a tap. Photo captions render markdown too (backticks
+→ tap-to-copy `code`), but only while the whole text fits Telegram's 1024-char
 caption cap; longer text becomes a follow-up message and the buttons detach from
 the photo.
+
+**Buttons on a PHOTO must ride `channelData.telegram.buttons`, not
+`presentation.blocks`.** On the media delivery path the framework's
+`renderPresentation` ALSO flattens every presentation block into the caption text
+(a `- label` markdown list Telegram renders as `• label`), so presentation-carried
+buttons show up twice: as caption bullets AND as the inline keyboard (the
+text-only path doesn't flatten, which is why the panel never showed this). Raw
+`channelData.telegram.buttons` (`[[{ text, callback_data }]]`, callback_data in
+the same opaque `tgcb1:` form via `opaqueCallbackData`) skips the flatten while
+still becoming a real inline keyboard — taps route back to this plugin's
+namespace handler exactly like the edit-in-place keyboard. Verified against the
+OpenClaw 2026.6.11 dist (`outbound-adapter`/`deliver`/`button-types` modules).
+
+**An attached photo never reaches a command handler.** `PluginCommandContext`
+carries text/addressing only — no media. The only plugin-visible route to an
+attached image is `api.registerHook("message:received", handler, { name })`
+(INTERNAL hook system: the key is `type:action`, NOT the config-hook name
+`message_received`; a missing `opts.name` fails the whole plugin registration).
+The event's payload sits under `event.context`: `content` (text/caption),
+`from`, and `metadata.mediaPath(s)` — OpenClaw has already downloaded the file
+to `.openclaw/media/inbound/` by then. The emit happens in dispatch-from-config
+BEFORE the command executes, and a photo-with-caption command takes exactly that
+path (Telegram's native `bot.command` shortcut matches only `msg.text`, never
+captions — which also means an image sent as a FILE/document with a command
+caption does NOT dispatch the command at all; it falls through to the LLM
+agent). The plugin records a sighting (sender + media paths) from the hook and
+the command handler claims it (`awaitReferenceFor`, sender-matched, short TTL),
+then stages the file for `agy` via `--add-dir` + an explicit
+use-this-reference-file instruction in the prompt.
 
 Consequences baked into the plugin:
 

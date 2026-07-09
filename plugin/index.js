@@ -17,7 +17,7 @@
 
 import { definePluginEntry } from "openclaw/plugin-sdk/core";
 import { spawn } from "node:child_process";
-import { copyFile, unlink, readFile, writeFile, mkdir, readdir, rename, stat } from "node:fs/promises";
+import { copyFile, unlink, readFile, writeFile, mkdir, readdir, rename, stat, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -26,6 +26,9 @@ const HOME = process.env.HOME || homedir();
 const GEMINI_DIR = path.join(HOME, ".gemini");
 const MODELS_CACHE = path.join(GEMINI_DIR, "antigravity-models.txt");
 const BRAIN_DIR = path.join(GEMINI_DIR, "antigravity-cli", "brain");
+// Throwaway per-generation dirs holding the user's attached reference image(s),
+// handed to agy via --add-dir. Created and removed around each generation.
+const REFS_DIR = path.join(GEMINI_DIR, "antigravity-cli", "refs");
 const WORKSPACE_DIR = process.env.OPENCLAW_WORKSPACE_DIR || path.join(HOME, ".openclaw", "workspace");
 const OUTBOUND_IMAGE_DIR = path.join(WORKSPACE_DIR, "outputs", "antigravity-images");
 // Keep only the newest N published images so the outbound folder never grows
@@ -47,6 +50,11 @@ const IMAGE_STORE_KEEP = 100;
 // binary's tool schema). The plugin can't pass tool args directly — the value is
 // injected as an instruction in the prompt text and the model fills the tool param.
 const ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"];
+
+// Max images one command may request. Each image is a separate agy call spending
+// a separate Google image-quota unit (Nano Banana 2), so keep this small.
+// Override with ANTIGRAVITY_IMAGE_MAX_COUNT.
+const MAX_IMAGE_COUNT = Math.max(1, Math.min(10, Number(process.env.ANTIGRAVITY_IMAGE_MAX_COUNT) || 4));
 
 // Last-resort model list if the cache helper has not populated a list yet.
 // The live list comes from `agy-models` (cached, self-refreshing daily).
@@ -210,12 +218,18 @@ async function writeImageStore(store) {
   await writeFile(tmp, JSON.stringify(store));
   await rename(tmp, IMAGE_STORE_FILE);
 }
-async function saveImagePrompt(prompt, aspect) {
+async function saveImagePrompt(prompt, aspect, count, refs) {
   return withImageStore(async () => {
     const store = await readImageStore();
     let id;
     do { id = Math.random().toString(36).slice(2, 8); } while (store[id]);
-    store[id] = { p: prompt, ...(aspect ? { ar: aspect } : {}), ts: Date.now() };
+    store[id] = {
+      p: prompt,
+      ...(aspect ? { ar: aspect } : {}),
+      ...(count > 1 ? { n: count } : {}),
+      ...(Array.isArray(refs) && refs.length ? { refs } : {}),
+      ts: Date.now(),
+    };
     await writeImageStore(store);
     return id;
   });
@@ -225,6 +239,120 @@ async function getImagePrompt(id) {
   const store = await readImageStore();
   const entry = store[id];
   return entry && typeof entry.p === "string" ? entry : null;
+}
+
+// ---- attached-image reference stash (for /antigravity_image with a photo) ----
+// A plugin command handler's ctx carries NO inbound media (verified against the
+// OpenClaw 2026.6 PluginCommandContext: only text/args + addressing). The only
+// plugin-visible path to an attached photo is the `message_received` hook, whose
+// event carries the downloaded file path in `event.metadata.mediaPath(s)`. That
+// hook fires (fire-and-forget) around command dispatch, BEFORE our command runs —
+// so the hook records a "sighting" (sender + downloaded image paths) here, and the
+// command handler picks it up. A plain JSON ring (not openKeyedStore, which is
+// gated to trusted/bundled plugins) for the same reason as the other stores.
+const IMAGE_REF_STORE_FILE = path.join(GEMINI_DIR, "antigravity-image-refs.json");
+const IMAGE_REF_KEEP = 20;             // ring size across all senders
+const IMAGE_REF_TTL_MS = 5 * 60_000;   // sightings older than this are ignored/pruned
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+let refStoreLock = Promise.resolve();
+function withRefStore(fn) {
+  const run = refStoreLock.then(fn, fn);
+  refStoreLock = run.then(() => {}, () => {});
+  return run;
+}
+async function readRefStore() {
+  try {
+    const arr = JSON.parse(await readFile(IMAGE_REF_STORE_FILE, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+}
+async function writeRefStore(list) {
+  await mkdir(GEMINI_DIR, { recursive: true });
+  const tmp = `${IMAGE_REF_STORE_FILE}.tmp`;
+  await writeFile(tmp, JSON.stringify(list.slice(-IMAGE_REF_KEEP)));
+  await rename(tmp, IMAGE_REF_STORE_FILE);
+}
+// Record that an /antigravity_image command from `sender`/`from` arrived carrying
+// `paths` image files (possibly empty — an empty sighting still lets the waiting
+// command resolve instantly instead of polling the full timeout).
+async function recordReferenceSighting(sender, from, paths) {
+  return withRefStore(async () => {
+    const now = Date.now();
+    const list = (await readRefStore()).filter((e) => e && now - (e.ts || 0) < IMAGE_REF_TTL_MS);
+    list.push({ s: String(sender ?? ""), f: String(from ?? ""), p: Array.isArray(paths) ? paths : [], ts: now, c: false });
+    await writeRefStore(list);
+  });
+}
+// Claim the freshest unconsumed sighting from this sender newer than `sinceMs`.
+// Returns its paths array (possibly empty) or null when there is no sighting yet.
+// Matching is sender-first: when BOTH sides know the sender id they must agree —
+// in a group chat `from` is shared by everyone, so a from-only match could hand
+// user A's attached photo to user B's concurrent command. `from` alone is only
+// trusted when one side lacks a sender id (defensive fallback).
+async function consumeReferenceSighting(senderId, from, sinceMs) {
+  return withRefStore(async () => {
+    const list = await readRefStore();
+    const s = String(senderId ?? "");
+    const f = String(from ?? "");
+    const matches = (e) => {
+      const es = String(e.s ?? "");
+      const ef = String(e.f ?? "");
+      if (s && es) return es === s;
+      return Boolean(f && ef && ef === f);
+    };
+    let idx = -1, bestTs = -1;
+    for (let i = 0; i < list.length; i++) {
+      const e = list[i];
+      if (!e || e.c) continue;
+      if (!matches(e)) continue;
+      if ((e.ts || 0) < sinceMs) continue;
+      if ((e.ts || 0) > bestTs) { bestTs = e.ts; idx = i; }
+    }
+    if (idx < 0) return null;
+    list[idx].c = true;
+    await writeRefStore(list);
+    return Array.isArray(list[idx].p) ? list[idx].p : [];
+  });
+}
+// Wait briefly for the message_received hook (fired ~concurrently, not awaited) to
+// land this command's sighting, then return its reference paths. [] means either
+// "seen, no photo attached" or "no sighting arrived" — both mean generate text-only.
+async function awaitReferenceFor(senderId, from, timeoutMs = 1500) {
+  const start = Date.now();
+  const since = start - 30_000; // only this message's sighting (hook fires just before us)
+  for (;;) {
+    const paths = await consumeReferenceSighting(senderId, from, since);
+    if (paths) return paths;
+    if (Date.now() - start >= timeoutMs) return [];
+    await sleep(120);
+  }
+}
+// True when a raw inbound message body is an /antigravity_image (or /antigravity
+// image) command — tolerates a `@BotName` suffix and the two-word form.
+function isImageCommandText(text) {
+  const m = (text || "").trim().match(/^\/([a-z0-9_]+)(?:@[a-z0-9_]+)?(?:\s+(\S+))?/i);
+  if (!m) return false;
+  const cmd = m[1].toLowerCase();
+  if (cmd === "antigravity_image") return true;
+  return cmd === "antigravity" && (m[2] || "").toLowerCase() === "image";
+}
+// Pull the downloaded IMAGE file paths off a message:received hook event.
+// The internal-hook event shape is { type, action, sessionKey, context, ... } with
+// the message fields under `context`: { from, content, ..., metadata: { senderId,
+// mediaPath(s), mediaType(s), ... } } (verified against the OpenClaw 2026.6 dist,
+// toInternalMessageReceivedContext). Prefer the media type; fall back to extension.
+function imagePathsFromEvent(event) {
+  const md = event?.context?.metadata || {};
+  const paths = Array.isArray(md.mediaPaths) && md.mediaPaths.length ? md.mediaPaths : (md.mediaPath ? [md.mediaPath] : []);
+  const types = Array.isArray(md.mediaTypes) && md.mediaTypes.length ? md.mediaTypes : (md.mediaType ? [md.mediaType] : []);
+  return paths.filter((p, i) => {
+    if (typeof p !== "string" || !p) return false;
+    const t = types[i] || types[0] || "";
+    if (/^image\//i.test(t)) return true;
+    if (t) return false; // a known non-image media type
+    return IMAGE_EXTS.has(path.extname(p).toLowerCase());
+  });
 }
 
 // When generate_image hits a Google-side error (429 quota / 503 capacity), the
@@ -270,6 +398,27 @@ function parseAspectPrefix(payload) {
   const m = trimmed.match(/^(\d{1,2}:\d{1,2})\s+(\S[\s\S]*)$/);
   if (m && ASPECT_RATIOS.includes(m[1])) return { aspect: m[1], rest: m[2].trim() };
   return { aspect: null, rest: trimmed };
+}
+
+// Inline count prefix: how many images to generate. Parsed AFTER the aspect prefix,
+// from the very start of the remaining prompt. Two accepted forms:
+//   - explicit multiplier: `x3` / `3x` / `х3` / `3х` (latin x or Cyrillic х)
+//   - count phrase with an image noun: `3 изображения|картинки|фото|варианта|штуки|
+//     кадра` (ru) or `3 images|pictures|photos|variants` (en)
+// The image noun is required so a plain leading number that describes the SUBJECT
+// ("3 котика идут гулять") stays a single image of three kittens, not three images.
+// The matched prefix is stripped; the remainder is the subject. Count is clamped to
+// [1, MAX_IMAGE_COUNT]. If stripping would leave no subject, the whole text is kept
+// as the subject and count falls back to 1.
+function parseCountPrefix(payload) {
+  const trimmed = (payload || "").trim();
+  const clamp = (n) => Math.max(1, Math.min(MAX_IMAGE_COUNT, n));
+  let m = trimmed.match(/^[xх]\s?(\d{1,2})(?=[\s,.:;)\-]|$)[\s,.:;)\-]*([\s\S]*)$/i) ||
+          trimmed.match(/^(\d{1,2})\s?[xх](?=[\s,.:;)\-]|$)[\s,.:;)\-]*([\s\S]*)$/i);
+  if (m && Number(m[1]) >= 1 && m[2].trim()) return { count: clamp(Number(m[1])), rest: m[2].trim() };
+  m = trimmed.match(/^(\d{1,2})\s+(?:изображени[а-яё]*|картин[а-яё]*|фото|вариант[а-яё]*|штук[а-яё]*|шт\.?|кадр[а-яё]*|images?|pictures?|photos?|variants?)(?=[\s,.:;)\-]|$)[\s,.:;)\-]*([\s\S]*)$/i);
+  if (m && Number(m[1]) >= 1 && m[2].trim()) return { count: clamp(Number(m[1])), rest: m[2].trim() };
+  return { count: 1, rest: trimmed };
 }
 
 // Detect a Google "quota exhausted" (HTTP 429 RESOURCE_EXHAUSTED) response in
@@ -449,9 +598,9 @@ function statusText(defaultModel, imageAspect) {
 // - *_HINT: plain fallback for the edit-in-place (button) path, where the raw
 //   editMessage text is not markdown-rendered, so backticks would show literally.
 const ASK_HINT = "✍️ Введите вопрос: /antigravity_ask текст вопроса";
-const IMAGE_HINT = "🖼 Введите запрос на генерацию изображения: /antigravity_image текст запроса (формат — первым словом: /antigravity_image 16:9 текст)";
+const IMAGE_HINT = "🖼 Введите запрос на генерацию изображения: /antigravity_image текст запроса\nФормат — первым словом (16:9), количество — x3 или «3 изображения …». Можно приложить фото-референс к сообщению.";
 const ASK_HINT_MD = "✍️ Введите вопрос: `/antigravity_ask` текст вопроса";
-const IMAGE_HINT_MD = "🖼 Введите запрос на генерацию изображения: `/antigravity_image` текст запроса\nФормат — первым словом: `/antigravity_image 16:9` текст запроса";
+const IMAGE_HINT_MD = "🖼 Введите запрос на генерацию изображения: `/antigravity_image` текст запроса\nФормат — первым словом: `/antigravity_image 16:9`; количество: `x3` или «3 изображения …».\nМожно приложить фото-референс к сообщению — сгенерирую с оглядкой на него.";
 
 // ---- renderers ----
 // Command reply (first render): the framework encodes `type:"callback"` -> tgcb1.
@@ -544,9 +693,10 @@ export default definePluginEntry({
     // command is displayed in (truncating what tap-to-copy yields), so the
     // DISPLAYED command swaps them for apostrophes and collapses newlines; the
     // stored prompt stays raw for Recreate.
-    function imageCommandFor(prompt, aspect) {
+    function imageCommandFor(prompt, aspect, count) {
       const p = prompt.replace(/`/g, "'").replace(/\s+/g, " ").trim();
-      return `/antigravity_image ${aspect ? `${aspect} ` : ""}${p}`;
+      const countPrefix = count > 1 ? `x${count} ` : "";
+      return `/antigravity_image ${aspect ? `${aspect} ` : ""}${countPrefix}${p}`;
     }
     // The caption shown under a generated photo: the tap-to-copy command as a
     // markdown code span (rendered on the command-reply AND adapter.sendPayload
@@ -555,24 +705,38 @@ export default definePluginEntry({
     // chars and only keeps the buttons on the photo when the text fits as a caption
     // (longer text becomes a buttonless follow-up message), so truncate rather than
     // overflow.
-    function imageCaption(prompt, aspect) {
-      const cmd = imageCommandFor(prompt, aspect);
+    function imageCaption(prompt, aspect, count) {
+      const cmd = imageCommandFor(prompt, aspect, count);
       return cmd.length + 2 <= 1000 ? `\`${cmd}\`` : `\`${cmd.slice(0, 997)}…\``;
     }
-    // Photo reply: caption + Recreate/Edit buttons.
-    function buildImageReply(prompt, aspect, mediaUrl, id) {
+    // Recreate/Edit inline keyboard, in the RAW Telegram shape (rows of
+    // {text, callback_data}). We deliver these via `channelData.telegram.buttons`
+    // rather than `presentation.blocks` on purpose: on the media/photo delivery
+    // path OpenClaw's renderPresentation flattens every presentation block into the
+    // caption text too (a `- label` list Telegram shows as `• label`), so a
+    // presentation-carried button renders BOTH as a caption bullet AND as a real
+    // key — the visible duplication. channelData buttons skip that flatten (no
+    // presentation to fold) while still becoming a real inline keyboard. The
+    // callback_data uses the same tgcb1: opaque form the framework expects, so taps
+    // route back to this plugin's interactive handler exactly like the edit-in-place
+    // keyboard already does.
+    function imageKeyboard(id) {
+      return [[
+        { text: "🔁 Ещё раз", callback_data: opaqueCallbackData(`${NS}:rc:${id}`) },
+        { text: "✏️ Изменить", callback_data: opaqueCallbackData(`${NS}:ed:${id}`) },
+      ]];
+    }
+    // Photo reply: caption + Recreate/Edit buttons. `mediaUrls` may hold one or many
+    // images; OpenClaw sends them as separate sendPhoto messages, with the caption
+    // and the inline keyboard attached to the FIRST image only.
+    function buildImageReply(prompt, aspect, count, mediaUrls, id) {
+      const media = mediaUrls.length === 1
+        ? { mediaUrl: mediaUrls[0] }
+        : { mediaUrls };
       return {
-        text: imageCaption(prompt, aspect),
-        mediaUrl,
-        presentation: {
-          blocks: [{
-            type: "buttons",
-            buttons: [
-              { label: "🔁 Ещё раз", action: { type: "callback", value: `${NS}:rc:${id}` } },
-              { label: "✏️ Изменить", action: { type: "callback", value: `${NS}:ed:${id}` } },
-            ],
-          }],
-        },
+        text: imageCaption(prompt, aspect, count),
+        ...media,
+        channelData: { telegram: { buttons: imageKeyboard(id) } },
       };
     }
 
@@ -584,16 +748,61 @@ export default definePluginEntry({
     // so windows never overlap.
     let imageQueue = Promise.resolve();
     let imageQueueDepth = 0;
-    function doImageQueued(payload, defaultModel, aspect) {
+    function doImageQueued(payload, defaultModel, aspect, count = 1, refPaths = []) {
       imageQueueDepth += 1;
       const run = imageQueue
-        .then(() => doImage(payload, defaultModel, aspect))
+        .then(() => doImage(payload, defaultModel, aspect, count, refPaths))
         .finally(() => { imageQueueDepth -= 1; });
       imageQueue = run.then(() => {}, () => {});
       return run;
     }
 
-    async function doImage(payload, defaultModel, aspect) {
+    // Remove refs/ staging dirs older than an hour. Normally each generation
+    // removes its own dir in doImage's finally, but a gateway crash/restart
+    // mid-generation orphans the dir forever — sweep those on the next run.
+    async function pruneStaleRefDirs() {
+      let entries;
+      try { entries = await readdir(REFS_DIR, { withFileTypes: true }); } catch { return; }
+      const cutoff = Date.now() - 60 * 60_000;
+      for (const ent of entries) {
+        if (!ent.isDirectory()) continue;
+        // Dir names start with the creation Date.now() — cheaper than stat and
+        // immune to mtime updates from the copy.
+        const born = Number(ent.name.split("-")[0]);
+        if (Number.isFinite(born) && born < cutoff) {
+          await rm(path.join(REFS_DIR, ent.name), { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    }
+
+    // Copy the user's attached reference image(s) into a fresh throwaway dir agy can
+    // see via --add-dir, with simple predictable names the prompt can point at.
+    // Returns { dir, names, addDirArgs } or null when there are no usable refs.
+    // `lost` is set when refPaths were given but NONE could be read (the inbound
+    // media file was pruned by OpenClaw) — callers surface that instead of silently
+    // degrading a "with this product" prompt to text-only.
+    async function stageReferenceImages(refPaths) {
+      const usable = (refPaths || []).filter((p) => typeof p === "string" && p);
+      if (!usable.length) return null;
+      await pruneStaleRefDirs().catch(() => {});
+      const dir = path.join(REFS_DIR, `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+      const names = [];
+      try {
+        await mkdir(dir, { recursive: true });
+        for (let i = 0; i < usable.length; i++) {
+          const ext = (path.extname(usable[i]).toLowerCase().match(/^\.(png|jpe?g|webp|gif)$/) || [".png"])[0];
+          const name = `ref${i + 1}${ext}`;
+          try { await copyFile(usable[i], path.join(dir, name)); names.push(name); } catch { /* skip missing/unreadable */ }
+        }
+      } catch { /* mkdir failed — fall through to cleanup */ }
+      if (!names.length) {
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        return { lost: true };
+      }
+      return { dir, names, addDirArgs: ["--add-dir", dir] };
+    }
+
+    async function doImage(payload, defaultModel, aspect, count = 1, refPaths = []) {
       // Strip leading markdown noise so a stray `*`/`_`/`#` doesn't make the model
       // return an empty response without calling the tool (see sanitizeImageSubject).
       const subject = sanitizeImageSubject(payload);
@@ -601,54 +810,150 @@ export default definePluginEntry({
       // instruction — the reasoning model copies it into generate_image's
       // AspectRatio parameter (its only supported values are ASPECT_RATIOS).
       const aspectClause = aspect ? ` Set the AspectRatio parameter of generate_image to "${aspect}".` : "";
-      const prompt = `Use your generate_image tool to create an image: ${subject}.${aspectClause} Save it as an artifact.`;
-      // The reasoning model is flaky at actually invoking generate_image (verified:
-      // ~1/3 of clean prompts still return an empty response with no image). That
-      // failure comes back FAST (no generation happened, no capacity spent), so
-      // retry a few times — only on that "no image, not a real Google-side error"
-      // case. Real conditions (capacity/quota/timeout) return immediately.
-      let r;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        // Only accept an image produced by THIS attempt: capture a start time (with
-        // a small clock-granularity margin) and ignore anything older, so a
-        // failed/no-op generation can't resend a stale image under the new caption.
-        const startMs = Date.now() - 2000;
-        r = await runAgy([...modelArgs(defaultModel), "--print-timeout", "3m", "-p", prompt], { timeoutMs: 210_000 });
-        const img = await newestBrainImage(startMs);
-        if (img) {
-          try {
-            const mediaUrl = await publishBrainImage(img);
-            const id = await saveImagePrompt(payload, aspect).catch((e) => {
-              api.logger?.warn?.(`antigravity: could not store image prompt: ${e}`);
-              return null;
-            });
-            // If the store write failed, fall back to the same command caption but
-            // no buttons (they'd dangle on a missing id).
-            return id ? buildImageReply(payload, aspect, mediaUrl, id) : { text: imageCaption(payload, aspect), mediaUrl };
-          } catch (e) {
-            api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
-            return { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` };
+      // Attached reference image(s): agy reads image files from its workspace and
+      // passes them to generate_image as input images (verified: it reproduces an
+      // unseen product's shape/colours/label from a --add-dir file it was told to
+      // use). So stage the file(s) and point the prompt at them.
+      const ref = await stageReferenceImages(refPaths);
+      const refLost = ref?.lost === true;
+      const staged = ref && !refLost ? ref : null;
+      const referenceClause = staged
+        ? ` The user's request refers to a specific product/object shown in reference image file(s) in your workspace: ${staged.names.join(", ")}. Treat those files as that exact referenced product/object (that is what phrases like "this product"/"вот этот товар" point to) and reproduce it faithfully in the generated image — same shape, colours, cap, label text and markings.`
+        : "";
+      const prompt = `Use your generate_image tool to create an image: ${subject}.${referenceClause}${aspectClause} Save it as an artifact.`;
+      const extraArgs = staged ? staged.addDirArgs : [];
+
+      // Generate ONE image, with the flaky-retry loop and Google-side error handling.
+      // The reasoning model is flaky at actually invoking generate_image (~1/3 of
+      // clean prompts still return an empty response with no image); that failure
+      // comes back FAST (no generation, no capacity spent), so retry a few times —
+      // only on that "no image, not a real Google-side error" case. Returns
+      // { image } on success, { stop: reply } on a systemic condition
+      // (capacity/quota/timeout) that should halt the whole batch, or { none } when
+      // the model simply never called the generator after retries.
+      async function attemptOneImage() {
+        let r;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          // Only accept an image produced by THIS attempt: capture a start time (with
+          // a small clock-granularity margin) and ignore anything older, so a
+          // failed/no-op generation can't resend a stale image under the new caption.
+          const startMs = Date.now() - 2000;
+          r = await runAgy([...modelArgs(defaultModel), ...extraArgs, "--print-timeout", "3m", "-p", prompt], { timeoutMs: 210_000 });
+          const img = await newestBrainImage(startMs);
+          if (img) {
+            try { return { image: await publishBrainImage(img) }; }
+            catch (e) {
+              api.logger?.error?.(`antigravity: publish image failed: ${e?.message || e}`);
+              return { stop: { text: `🖼 Картинка сгенерирована, но не удалось подготовить её к отправке.\n${String(e?.message || e).slice(0, 200)}` } };
+            }
           }
+          // Real Google-side / timeout conditions: report, don't retry. A 503 (image
+          // model overloaded on Google's side) is transient and NOT the user's quota —
+          // check it before detectQuotaError, whose "capacity exhausted" match would
+          // otherwise mislabel it as a quota.
+          if (detectCapacityError(r.out || r.err)) return { stop: { text: "🕐 Модель картинок Google (Nano Banana 2 / gemini-3.1-flash-image) временно перегружена (503, MODEL_CAPACITY_EXHAUSTED) — это на стороне Google, а не твоя квота. Попробуй ещё раз через минуту-другую." } };
+          const quota = detectQuotaError(r.out || r.err);
+          if (quota) return { stop: { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` } };
+          if (r.timedOut) return { stop: { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." } };
+          // Empty stdout can hide a Google-side error the model "handled" silently
+          // (retry timers + status artifact instead of relaying the failure). Check
+          // this run's brain transcript before burning the remaining attempts.
+          const brainErr = await detectBrainError(startMs).catch(() => null);
+          if (brainErr?.quota) return { stop: { text: "🚫 Квота Google на генерацию картинок исчерпана (429 RESOURCE_EXHAUSTED — видно в журнале agy). Обычно сброс в течение ~15 минут — попробуй позже.\nКартинки идут по отдельной квоте (модель Nano Banana 2), /antigravity ask работает как обычно." } };
+          if (brainErr?.capacity) return { stop: { text: "🕐 Модель картинок Google временно перегружена (503) — это на стороне Google, не твоя квота. Попробуй ещё раз через минуту-другую." } };
+          // else: model genuinely didn't call the tool -> retry.
+          api.logger?.info?.(`antigravity: image attempt ${attempt} produced no image; retrying`);
         }
-        // Real Google-side / timeout conditions: report, don't retry.
-        // A 503 (image model overloaded on Google's side) is transient and NOT the
-        // user's quota — check it before detectQuotaError, whose "capacity exhausted"
-        // match would otherwise mislabel it as a quota.
-        if (detectCapacityError(r.out || r.err)) return { text: "🕐 Модель картинок Google (Nano Banana 2 / gemini-3.1-flash-image) временно перегружена (503, MODEL_CAPACITY_EXHAUSTED) — это на стороне Google, а не твоя квота. Попробуй ещё раз через минуту-другую." };
-        const quota = detectQuotaError(r.out || r.err);
-        if (quota) return { text: `🚫 Квота Google на генерацию картинок исчерпана.${quotaResetSuffix(quota.reset)}\nКартинки идут по отдельной квоте (модель Nano Banana 2), не связанной с текстовыми моделями — /antigravity ask работает как обычно.` };
-        if (r.timedOut) return { text: "⏳ Генерация картинки не уложилась в тайм-аут. Попробуй позже или упрости запрос." };
-        // Empty stdout can hide a Google-side error the model "handled" silently
-        // (retry timers + status artifact instead of relaying the failure). Check
-        // this run's brain transcript before burning the remaining attempts.
-        const brainErr = await detectBrainError(startMs).catch(() => null);
-        if (brainErr?.quota) return { text: "🚫 Квота Google на генерацию картинок исчерпана (429 RESOURCE_EXHAUSTED — видно в журнале agy). Обычно сброс в течение ~15 минут — попробуй позже.\nКартинки идут по отдельной квоте (модель Nano Banana 2), /antigravity ask работает как обычно." };
-        if (brainErr?.capacity) return { text: "🕐 Модель картинок Google временно перегружена (503) — это на стороне Google, не твоя квота. Попробуй ещё раз через минуту-другую." };
-        // else: model genuinely didn't call the tool -> retry.
-        api.logger?.info?.(`antigravity: image attempt ${attempt} produced no image; retrying`);
+        return { none: true };
       }
-      return { text: "Не получилось сгенерировать картинку (модель не вызвала генератор). Попробуй ещё раз или упрости запрос — иногда помогает смена модели в /antigravity model." };
+
+      try {
+        const mediaUrls = [];
+        let stop = null;
+        for (let i = 0; i < count; i++) {
+          const res = await attemptOneImage();
+          if (res.image) { mediaUrls.push(res.image); continue; }
+          if (res.stop) { stop = res.stop; break; } // capacity/quota/timeout — stop spending
+          // res.none: this variant never produced an image — try the next one.
+        }
+
+        if (mediaUrls.length === 0) {
+          return stop ?? { text: "Не получилось сгенерировать картинку (модель не вызвала генератор). Попробуй ещё раз или упрости запрос — иногда помогает смена модели в /antigravity model." };
+        }
+
+        // Persist the prompt (with count + refs) so Recreate/Edit can reproduce the
+        // whole batch. If the store write fails, fall back to a caption with no
+        // buttons (they'd dangle on a missing id).
+        const id = await saveImagePrompt(payload, aspect, count, refPaths).catch((e) => {
+          api.logger?.warn?.(`antigravity: could not store image prompt: ${e}`);
+          return null;
+        });
+        const reply = id
+          ? buildImageReply(payload, aspect, count, mediaUrls, id)
+          : { text: imageCaption(payload, aspect, count), ...(mediaUrls.length === 1 ? { mediaUrl: mediaUrls[0] } : { mediaUrls }) };
+        // Partial batch (asked for N, got fewer): deliver what we have and prepend a
+        // short note above the tap-to-copy command.
+        if (mediaUrls.length < count) {
+          const note = stop
+            ? `⚠️ Готово ${mediaUrls.length} из ${count} — дальше не вышло: ${plainText(stop.text).split("\n")[0]}`
+            : `⚠️ Готово ${mediaUrls.length} из ${count} (часть не удалась — модель не вызвала генератор).`;
+          reply.text = `${note}\n${reply.text}`;
+        }
+        // Recreate after OpenClaw pruned the inbound media: the original photo is
+        // gone, so this run was text-only — say so instead of pretending.
+        if (refLost) {
+          reply.text = `⚠️ Исходное фото-референс уже недоступно (вычищено из хранилища) — сгенерировано только по тексту. Отправь команду с фото заново, чтобы вернуть референс.\n${reply.text}`;
+        }
+        return reply;
+      } finally {
+        if (staged) await rm(staged.dir, { recursive: true, force: true }).catch(() => {});
+      }
     }
+
+    // Shared entry for both image command shapes: parse the optional `16:9` aspect
+    // prefix and `x3` / "3 изображения" count prefix, claim any photo attached to
+    // this command (via the message_received hook), then queue the generation.
+    async function runImageCommand(ctx, payload, defaultModel) {
+      if (!payload) return asHintReply(IMAGE_HINT_MD);
+      const { aspect: inlineAspect, rest: afterAspect } = parseAspectPrefix(payload);
+      if (!afterAspect) return asHintReply(IMAGE_HINT_MD);
+      const { count, rest } = parseCountPrefix(afterAspect);
+      if (!rest) return asHintReply(IMAGE_HINT_MD);
+      // Same queue cap the Recreate button has: with counts a single command can be
+      // ×MAX_IMAGE_COUNT quota units, so don't let impatient re-sends stack an hour
+      // of serialized generations (and Google image quota) behind one chat.
+      if (imageQueueDepth >= 2) {
+        return { text: "⏳ Уже генерирую предыдущие запросы — дождись их и отправь команду ещё раз." };
+      }
+      const aspect = inlineAspect ?? await getImageAspect();
+      const refPaths = await awaitReferenceFor(ctx.senderId, ctx.from);
+      return doImageQueued(rest, defaultModel, aspect, count, refPaths);
+    }
+
+    // ---- inbound hook: capture a photo attached to an /antigravity_image command.
+    // A plugin command handler's ctx has no media, so we record the downloaded
+    // image path(s) here and the command handler claims the sighting via
+    // awaitReferenceFor. registerHook lands in OpenClaw's INTERNAL hook system,
+    // whose event keys are `type` / `type:action` — so the key is
+    // "message:received" (NOT "message_received", that name belongs to the
+    // separate config-file hook runner). The internal emit fires in
+    // dispatch-from-config right before the inbound turn is processed, i.e. before
+    // our command executes — a photo-with-caption command takes exactly that path
+    // (Telegram's native bot.command shortcut only matches text messages, not
+    // captions). Fires only for our image command; everything else is a single
+    // cheap regex and return.
+    api.registerHook("message:received", async (event) => {
+      try {
+        const content = typeof event?.context?.content === "string" ? event.context.content : "";
+        if (!isImageCommandText(content)) return;
+        const paths = imagePathsFromEvent(event);
+        const sender = event?.context?.metadata?.senderId ?? "";
+        const from = event?.context?.from ?? "";
+        await recordReferenceSighting(sender, from, paths);
+      } catch (e) {
+        api.logger?.warn?.(`antigravity: message:received hook failed: ${e?.message || e}`);
+      }
+    }, { name: "antigravity-image-ref-capture", description: "Capture a photo attached to /antigravity_image so the command can use it as a reference." });
 
     // ---- outbound adapter: the only way to deliver MEDIA (or markdown) from an
     // interactive handler. ctx.respond.reply/editMessage are text-only and plain;
@@ -729,12 +1034,14 @@ export default definePluginEntry({
             return { handled: true };
           }
           const aspect = entry.ar || null;
+          const count = entry.n || 1;
+          const refs = Array.isArray(entry.refs) ? entry.refs : [];
           if (payload.startsWith("ed:")) {
             // Edit: hand the user the exact command to tweak. adapter.sendPayload
             // renders markdown -> the backticked command is tap-to-copy; if the
             // adapter is unavailable, fall back to plain respond.reply (copyable
             // via long-press, just not one-tap).
-            const cmd = imageCommandFor(entry.p, aspect);
+            const cmd = imageCommandFor(entry.p, aspect, count);
             const sent = await sendPayloadToChat(ctx, { text: `✏️ Скопируй, поправь и отправь:\n\`${cmd}\`` });
             if (!sent) {
               try { await ctx.respond.reply({ text: `✏️ Скопируй, поправь и отправь:\n${cmd}` }); } catch { /* ignore */ }
@@ -748,13 +1055,13 @@ export default definePluginEntry({
               try { await ctx.respond.reply({ text: "⏳ Уже генерирую — дождись текущей картинки." }); } catch { /* ignore */ }
               return { handled: true };
             }
-            try { await ctx.respond.reply({ text: `🎨 Генерирую заново${aspect ? ` (${aspect})` : ""}…` }); } catch { /* ignore */ }
+            try { await ctx.respond.reply({ text: `🎨 Генерирую заново${count > 1 ? ` ×${count}` : ""}${aspect ? ` (${aspect})` : ""}…` }); } catch { /* ignore */ }
             const model = defaultModel;
             (async () => {
-              const reply = await doImageQueued(entry.p, model, aspect);
+              const reply = await doImageQueued(entry.p, model, aspect, count, refs);
               const sent = await sendPayloadToChat(ctx, reply);
               if (!sent) {
-                const note = reply.mediaUrl
+                const note = (reply.mediaUrl || reply.mediaUrls)
                   ? "Картинка сгенерирована, но не удалось отправить её из кнопки — отправь команду заново."
                   : plainText(reply.text || "Не получилось сгенерировать картинку.");
                 try { await ctx.respond.reply({ text: note }); } catch { /* ignore */ }
@@ -851,10 +1158,7 @@ export default definePluginEntry({
         }
 
         if (sub === "image") {
-          if (!payload) return asHintReply(IMAGE_HINT_MD);
-          const { aspect: inlineAspect, rest } = parseAspectPrefix(payload);
-          if (!rest) return asHintReply(IMAGE_HINT_MD);
-          return doImageQueued(rest, defaultModel, inlineAspect ?? await getImageAspect());
+          return runImageCommand(ctx, payload, defaultModel);
         }
 
         if (sub === "continue") {
@@ -894,10 +1198,7 @@ export default definePluginEntry({
       handler: async (ctx) => {
         const payload = (ctx.args ?? "").trim();
         const defaultModel = await getDefaultModel();
-        if (!payload) return asHintReply(IMAGE_HINT_MD);
-        const { aspect: inlineAspect, rest } = parseAspectPrefix(payload);
-        if (!rest) return asHintReply(IMAGE_HINT_MD);
-        return doImageQueued(rest, defaultModel, inlineAspect ?? await getImageAspect());
+        return runImageCommand(ctx, payload, defaultModel);
       },
     });
 

@@ -79,13 +79,30 @@ once (below).
     The plugin can't pass tool args to `agy`, so the ratio rides as a prompt
     instruction and the reasoning model fills `generate_image`'s `AspectRatio`
     parameter (verified live: `16:9` → 1376×768).
+  - **Count**: after the (optional) ratio — `x3` / `3x`, or naturally: `3
+    изображения …` / `3 варианта …` / `3 images …`. A plain leading number that
+    describes the subject («3 котика идут гулять») stays ONE image of three
+    kittens — a count needs the image-noun form or the `x` prefix. Images are
+    generated sequentially (one `agy` call each) and delivered as separate
+    photos; caption and buttons ride the first one. Capped at 4 per command
+    (each image spends a Google image-quota unit; override with the
+    `ANTIGRAVITY_IMAGE_MAX_COUNT` env var, hard max 10).
+  - **Photo reference**: attach a photo to the command message (as a compressed
+    photo, not a file) — `/antigravity_image кот держит вот этот товар` + фото
+    товара. The plugin captures the downloaded attachment via a
+    `message:received` hook, hands it to `agy` via `--add-dir`, and instructs the
+    model to reproduce that exact object (verified live: shape, colours and label
+    text carry over). An image sent as a FILE (document) does not dispatch the
+    command at all — Telegram/OpenClaw route document captions to the LLM agent.
   - **Under every photo**: two inline buttons. **🔁 Ещё раз** regenerates with the
-    same prompt + ratio and posts a new photo; **✏️ Изменить** sends the full
-    command as tap-to-copy monospace so you can tweak and resend. The caption
-    itself also carries the tap-to-copy command (kept ≤1024 chars so the buttons
-    stay attached to the photo). Prompts are stored by short id in
-    `~/.gemini/antigravity-image-prompts.json` (callback_data is capped at 64
-    bytes; newest 100 kept), so buttons on very old photos may expire.
+    same prompt + ratio + count + photo reference and posts new photo(s);
+    **✏️ Изменить** sends the full command as tap-to-copy monospace so you can
+    tweak and resend. The caption itself also carries the tap-to-copy command
+    (kept ≤1024 chars so the buttons stay attached to the photo). Prompts are
+    stored by short id in `~/.gemini/antigravity-image-prompts.json`
+    (callback_data is capped at 64 bytes; newest 100 kept), so buttons on very
+    old photos may expire. If OpenClaw has already pruned the referenced inbound
+    photo, a regenerate says so and falls back to text-only.
 - `/antigravity ping` — quick auth probe. `/antigravity reset` — clear default model.
 
 Navigation is edit-in-place: tapping a button rewrites the same panel message
