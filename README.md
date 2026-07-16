@@ -23,7 +23,12 @@ pretending to be the old `gemini` CLI.
 
 Works on any **OpenClaw host** running the gateway as a dedicated service user. It
 is OpenClaw-specific glue — it installs into the OpenClaw gateway via `openclaw
-plugins install`, so it does not apply to non-OpenClaw agent stacks.
+plugins install`, so it does not apply to non-OpenClaw agent stacks. The one
+supported exception is Nick's **Hermes** host (a Python Telegram agent running
+`codex exec`, no OpenClaw): the agy install, the OAuth login, and the two agent
+skills port over — see [`docs/hermes-deployment.md`](docs/hermes-deployment.md)
+(in Russian, matching the Hermes docs). The `/antigravity` panel plugin itself
+does not port.
 
 ## Why a plugin (not a skill)
 
@@ -364,6 +369,7 @@ scripts/healthcheck.sh     end-to-end verification, non-zero exit on failure
 scripts/uninstall.sh       remove plugin + symlink + helper (--purge also removes agy)
 scripts/secret-scan.sh     fail if any tracked file looks like a credential
 docs/plugin-internals.md   maintainer design notes: command/rendering model + onboarding internals
+docs/hermes-deployment.md  deploying agy + the agent skills on the Hermes host (no OpenClaw; RU)
 docs/onboarding-improvement-plan.md  design notes for the onboarding flow
 .github/workflows/preflight.yml  CI gate: shell/plugin syntax, JSON, secret-scan, no *bak*
 ```
