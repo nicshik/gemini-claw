@@ -310,7 +310,7 @@ class FatalError(Exception):
     """A condition that dooms every remaining variant (e.g. unwritable outputs dir)."""
 
 
-def generate_one(agy, model, aspect, subject, timeout, env):
+def generate_one(agy, model, aspect, subject, timeout, env, refs=()):
     """Produce one image. Returns (kind, payload):
     ('ok', Path) | ('flaky', None) | ('capacity', None) | ('quota', reset|None) | ('timeout', None).
     Raises FatalError on an unwritable outputs dir."""
@@ -318,14 +318,27 @@ def generate_one(agy, model, aspect, subject, timeout, env):
     # instruction; the reasoning model copies it into generate_image's AspectRatio.
     aspect_clause = (f' Set the AspectRatio parameter of generate_image to "{aspect}".'
                      if aspect else "")
+    # Reference images ride the same way the plugin passes a photo attachment:
+    # their directories go to agy via --add-dir (so it may read the files), and the
+    # prompt names the exact paths and pins the model to reproducing their content.
+    ref_clause = ""
+    if refs:
+        listed = ", ".join(str(r) for r in refs)
+        ref_clause = (
+            f" Use the image file(s) at {listed} as the visual reference: base the"
+            " result on them and reproduce the referenced object/scene exactly"
+            " (shape, colours, label text) unless the description says otherwise."
+        )
     prompt = (f"Use your generate_image tool to create an image: {subject}."
-              f"{aspect_clause} Save it as an artifact.")
+              f"{aspect_clause}{ref_clause} Save it as an artifact.")
     # Keep agy's own print-timeout ~30s below our hard kill (mirrors the plugin's
     # 3m/210s pairing) so the two limits track instead of fighting.
     print_timeout = max(30, timeout - 30)
     cmd = [agy]
     if model:
         cmd += ["--model", model]
+    for d in dict.fromkeys(str(Path(r).parent) for r in refs):
+        cmd += ["--add-dir", d]
     cmd += ["--print-timeout", f"{print_timeout}s", "-p", prompt]
 
     # The reasoning model is flaky at actually invoking generate_image (~1/3 of clean
@@ -386,6 +399,9 @@ def main():
                     help="agy reasoning model (default: the pult's default_model)")
     ap.add_argument("-n", "--count", type=int, default=1,
                     help=f"number of variants (1..{MAX_COUNT})")
+    ap.add_argument("--reference", action="append", default=[], metavar="PATH",
+                    help="reference image file to base the result on (image-to-image / "
+                         "edit); repeatable for multiple references")
     ap.add_argument("--timeout", type=int, default=210,
                     help="hard seconds per image; agy's own limit tracks ~30s below it "
                          "(default 210)")
@@ -410,9 +426,18 @@ def main():
     count = max(1, min(MAX_COUNT, args.count))
     subject = sanitize_subject(" ".join(args.prompt))
 
+    refs = []
+    for raw in args.reference:
+        p = Path(raw).expanduser().resolve()
+        if not p.is_file():
+            print(f"error: reference image not found: {raw}", file=sys.stderr)
+            return 2
+        refs.append(p)
+
     if args.dry_run:
+        ref_note = f" refs={','.join(str(r) for r in refs)}" if refs else ""
         print(f"dry-run: agy={agy or 'NOT FOUND'} model={model or '(agy default)'} "
-              f"aspect={aspect or 'auto'} count={count} out={OUT_DIR}")
+              f"aspect={aspect or 'auto'} count={count} out={OUT_DIR}{ref_note}")
         return 0 if (agy and subject) else 2
     if not agy:
         print("error: agy CLI not found or not executable (looked in /usr/local/bin/agy, "
@@ -431,7 +456,7 @@ def main():
         if count > 1:
             print(f"variant {i + 1}/{count} ...", file=sys.stderr)
         try:
-            kind, payload = generate_one(agy, model, aspect, subject, args.timeout, env)
+            kind, payload = generate_one(agy, model, aspect, subject, args.timeout, env, refs=refs)
         except FatalError as e:
             print(f"error: {e}", file=sys.stderr)
             return 3
