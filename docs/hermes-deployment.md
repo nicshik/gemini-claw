@@ -207,6 +207,10 @@ EOF
   запрос Antigravity/agy/Nano Banana → `/usr/local/bin/antigravity-image`,
   скопировать `IMAGE:`-пути в каталог задачи) и описать оба скилла в разделе
   «Selected skills»;
+- `hermes_agent/codex_runner.py` — то же исключение в `image_instruction`
+  внутри `build_wrapped_prompt`: эта инструкция («ОБЯЗАТЕЛЬНО вызови
+  `./bin/image-gen`») вшивается в каждый промпт задачи и перебивает даже
+  AGENTS.md, без исключения в ней codex всё равно уйдёт в `image_gen`;
 - `hermes_agent/config.py` — добавить в `SKILL_CATALOG`:
   `"antigravity_image": "картинки через Antigravity (agy, Nano Banana 2) по подписке Google AI Pro"`,
   `"antigravity_ask": "вопрос модели через Antigravity CLI (agy)"`;
@@ -214,8 +218,11 @@ EOF
   и пункт в `SKILL_MENU_ITEMS`;
 
 и задеплоить Hermes штатным `scripts/deploy-hermes.sh` (он же перезапустит
-юнит). Референс: PR `hermes#127`. Это правка другого репозитория, поэтому в
-gemini-claw она не автоматизирована.
+юнит). Референс: PR `hermes#127` (AGENTS.md + config.py) и `hermes#128`
+(codex_runner.py). Это правка другого репозитория, поэтому в gemini-claw она
+не автоматизирована. Проверено e2e 2026-07-16: `codex exec` с боевым wrapped
+prompt выбрал `antigravity_image`, сгенерировал файл и скопировал его в
+каталог задачи.
 
 ## Шаг 8. Проверка
 
