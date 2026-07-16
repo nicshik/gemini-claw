@@ -21,14 +21,11 @@ the gateway's `PATH`, and installs a native OpenClaw plugin that exposes a
 `/antigravity` control panel in chat (Telegram) — no translation shims, no
 pretending to be the old `gemini` CLI.
 
-Works on any **OpenClaw host** running the gateway as a dedicated service user. It
-is OpenClaw-specific glue — it installs into the OpenClaw gateway via `openclaw
-plugins install`, so it does not apply to non-OpenClaw agent stacks. The one
-supported exception is Nick's **Hermes** host (a Python Telegram agent running
-`codex exec`, no OpenClaw): the agy install, the OAuth login, and the two agent
-skills port over — see [`docs/hermes-deployment.md`](docs/hermes-deployment.md)
-(in Russian, matching the Hermes docs). The `/antigravity` panel plugin itself
-does not port.
+Works on any **OpenClaw host** running the gateway as a dedicated service user
+(the plugin installs via `openclaw plugins install`), and on a **Hermes host** —
+a Python Telegram agent running `codex exec` with no OpenClaw — via its own
+installer: see [Install on a Hermes host](#install-on-a-hermes-host-no-openclaw).
+Other agent stacks are not supported.
 
 ## Why a plugin (not a skill)
 
@@ -232,6 +229,33 @@ not transfer between hosts), the **inlineButtons** capability set for that bot, 
 OpenClaw >= 2026.6.11. Where the gateway uses the default layout (user `openclaw`,
 CLI `/opt/openclaw/bin/openclaw`), the env overrides can be omitted entirely.
 
+### Install on a Hermes host (no OpenClaw)
+
+Hermes is a Python Telegram agent that runs `codex exec` under a hardened
+systemd unit — no OpenClaw, so the plugin does not apply. What ports over: the
+agy install, the OAuth login, the model-list cache, and the two agent skills
+(`antigravity_ask`, `antigravity_image`, including `--reference` photo edits).
+The dedicated installer wires all of it, idempotently:
+
+```bash
+git clone https://github.com/nicshik/gemini-claw /root/gemini-claw
+cd /root/gemini-claw
+sudo scripts/install-hermes.sh                    # agy + agy-models + drop-in + skills + wrappers
+sudo OPENCLAW_USER=hermes scripts/login.sh        # one-time Google AI Pro OAuth (browser)
+sudo RESTART_AGENT=1 scripts/install-hermes.sh    # restart the unit once to apply the drop-in
+sudo scripts/healthcheck-hermes.sh                # verify the whole chain
+```
+
+Defaults assume user `hermes`, unit `hermes-agent`, workspace
+`/srv/hermes-agent/workspace` — override via `HERMES_USER` / `HERMES_UNIT` /
+`HERMES_WORKSPACE`. Updates are `git pull` + re-run `install-hermes.sh`.
+
+The bot-side half (skill registry, task routing, the native `/antigravity`
+panel, photo-with-caption reference tasks) lives in the Hermes repo itself. The
+full walk-through — what ports, host facts, the bot-side changes, operations —
+is [`docs/hermes-deployment.md`](docs/hermes-deployment.md) (in Russian,
+matching the Hermes docs).
+
 ### Login flow
 
 `scripts/login.sh` runs `agy` in a `tmux` session, prints the Google authorization
@@ -369,7 +393,9 @@ scripts/healthcheck.sh     end-to-end verification, non-zero exit on failure
 scripts/uninstall.sh       remove plugin + symlink + helper (--purge also removes agy)
 scripts/secret-scan.sh     fail if any tracked file looks like a credential
 docs/plugin-internals.md   maintainer design notes: command/rendering model + onboarding internals
-docs/hermes-deployment.md  deploying agy + the agent skills on the Hermes host (no OpenClaw; RU)
+docs/hermes-deployment.md  deploying agy + the agent skills on a Hermes host (no OpenClaw; RU)
+scripts/install-hermes.sh  idempotent Hermes installer: agy + agy-models + systemd drop-in + skills + wrappers
+scripts/healthcheck-hermes.sh  end-to-end verification on a Hermes host, non-zero exit on failure
 docs/onboarding-improvement-plan.md  design notes for the onboarding flow
 .github/workflows/preflight.yml  CI gate: shell/plugin syntax, JSON, secret-scan, no *bak*
 ```

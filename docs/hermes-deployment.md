@@ -65,6 +65,23 @@
 пометражным биллингом). `antigravity_image` закрывает ту же потребность через
 подписку Google AI Pro по OAuth — без API-ключа и биллинга.
 
+## Быстрый путь
+
+Серверную часть (шаги 1–6 и agy-models) ставит один идемпотентный скрипт —
+ручные шаги ниже остаются как разбор того, что он делает, и для отладки:
+
+```bash
+git clone https://github.com/nicshik/gemini-claw /root/gemini-claw
+cd /root/gemini-claw
+sudo scripts/install-hermes.sh                    # agy + agy-models + drop-in + скиллы + обёртки
+sudo OPENCLAW_USER=hermes scripts/login.sh        # одноразовый OAuth Google AI Pro (браузер)
+sudo RESTART_AGENT=1 scripts/install-hermes.sh    # один рестарт юнита (применить drop-in)
+sudo scripts/healthcheck-hermes.sh                # сквозная проверка
+```
+
+Обновление: `cd /root/gemini-claw && git pull && sudo scripts/install-hermes.sh`.
+Правки в репозитории hermes (шаг 7) скрипт не делает.
+
 ## Шаг 0. Предпосылки
 
 - root-доступ по SSH на хост Hermes.
@@ -238,10 +255,14 @@ EOF
   запрос Antigravity/agy/Nano Banana → `/usr/local/bin/antigravity-image`,
   скопировать `IMAGE:`-пути в каталог задачи) и описать оба скилла в разделе
   «Selected skills»;
-- `hermes_agent/codex_runner.py` — то же исключение в `image_instruction`
-  внутри `build_wrapped_prompt`: эта инструкция («ОБЯЗАТЕЛЬНО вызови
-  `./bin/image-gen`») вшивается в каждый промпт задачи и перебивает даже
-  AGENTS.md, без исключения в ней codex всё равно уйдёт в `image_gen`;
+- `hermes_agent/codex_runner.py` — `image_instruction` внутри
+  `build_wrapped_prompt` вшивается в каждый промпт задачи и перебивает даже
+  AGENTS.md, поэтому она должна знать про antigravity. Итоговая версия
+  (PR `hermes#128` + `hermes#134`) зависит от живого конфига: при пустом
+  `GEMINI_API_KEY` основной картиночный инструмент — `antigravity_image`
+  (image-gen явно запрещён — он без ключа умеет только падать), при
+  настроенном ключе — `image-gen` с исключением для явных запросов
+  Antigravity/agy/Nano Banana;
 - `hermes_agent/config.py` — добавить в `SKILL_CATALOG`:
   `"antigravity_image": "картинки через Antigravity (agy, Nano Banana 2) по подписке Google AI Pro"`,
   `"antigravity_ask": "вопрос модели через Antigravity CLI (agy)"`;
