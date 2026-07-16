@@ -41,12 +41,23 @@ this skill over `imagegen`.
   aspect (`~/.gemini/antigravity-skill.json` -> `image_aspect`).
 - `--model NAME` — agy reasoning model (default: the pult's `default_model`). The image
   itself is always Nano Banana 2 (fixed by agy); this only picks the reasoning model.
+- `--reference PATH` — reference image for image-to-image / edits: the result is based
+  on that file (object shape, colours, label text carry over). Repeatable. Use it when
+  Nick attaches a photo and asks to edit it or build around it (поменять фон, добавить
+  элемент, обложка для маркетплейса с этим товаром). The path must be a real local file
+  from the current task (an inbound attachment or a task-dir file) — never invent one.
 - `--dry-run` — verify agy/env without spending quota.
 
 Example — Nick's "5 variants" request:
 
 ```bash
 ~/.openclaw/workspace/bin/antigravity-image -n 5 --aspect 16:9 "фотореализм, зарянка и пума идут гулять в парк, естественный дневной свет, без текста и водяных знаков"
+```
+
+Example — edit an attached product photo:
+
+```bash
+~/.openclaw/workspace/bin/antigravity-image --aspect 3:4 --reference /path/to/inbound-photo.jpg "обложка карточки маркетплейса: этот же товар, чистый белый фон, мягкая тень"
 ```
 
 ## Delivering the result to the user
