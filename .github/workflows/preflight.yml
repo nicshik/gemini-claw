@@ -16,6 +16,9 @@ jobs:
       - name: Check shell syntax
         run: bash -n scripts/*.sh bin/agy-models
 
+      - name: Check python skill scripts
+        run: python3 -m py_compile $(git ls-files 'skills/*/scripts/*.py')
+
       - name: Check plugin syntax
         run: node --check plugin/index.js
 
