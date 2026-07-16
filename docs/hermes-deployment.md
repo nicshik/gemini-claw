@@ -167,6 +167,34 @@ chmod 0755 /usr/local/bin/antigravity-image /usr/local/bin/antigravity-ask
 `/srv/hermes-agent/workspace/outputs/antigravity-skill-images/` (юниту туда
 можно писать; каталог самоочищается до 20 последних файлов).
 
+Для пульта `/antigravity` в боте (см. шаг 7) нужен и кэш-хелпер списка
+моделей — тот же `bin/agy-models`, что на OpenClaw:
+
+```bash
+install -m 0755 /root/gemini-claw/bin/agy-models /usr/local/bin/agy-models
+cat > /etc/systemd/system/antigravity-models-refresh.service <<'EOF'
+[Unit]
+Description=Refresh Antigravity (agy) model-list cache for the /antigravity panel
+[Service]
+Type=oneshot
+User=hermes
+Environment=HOME=/home/hermes
+ExecStart=/usr/local/bin/agy-models --refresh
+EOF
+cat > /etc/systemd/system/antigravity-models-refresh.timer <<'EOF'
+[Unit]
+Description=Daily refresh of the Antigravity model-list cache
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload && systemctl enable --now antigravity-models-refresh.timer
+sudo -u hermes env HOME=/home/hermes /usr/local/bin/agy-models --refresh
+```
+
 ## Шаг 6. Дописать в SKILL.md правила для Hermes
 
 Установленные SKILL.md написаны под OpenClaw-пути и не знают про доставку
@@ -184,6 +212,8 @@ cat >> /srv/hermes-agent/workspace/skills/antigravity_image/SKILL.md <<'EOF'
   промпте строкой «Каталог для файлов этой задачи: <путь>»). После генерации
   скопируй каждый файл из строк `IMAGE: <путь>` в этот каталог:
   `cp "<путь из IMAGE:>" "<каталог задачи>/"`.
+- Если в промпте задачи указан референс-файл (строка «Референс-изображение:
+  <путь>») — передай его через `--reference <путь>`.
 - Не утверждай, что картинка готова и отправлена, пока файл не лежит в
   каталоге задачи.
 EOF
@@ -223,6 +253,21 @@ EOF
 не автоматизирована. Проверено e2e 2026-07-16: `codex exec` с боевым wrapped
 prompt выбрал `antigravity_image`, сгенерировал файл и скопировал его в
 каталог задачи.
+
+Поверх базовой маршрутизации в Hermes перенесены и остальные части
+gemini-claw (задеплоено 2026-07-16):
+
+- **Пульт `/antigravity`** — нативная команда бота (PR `hermes#133`): кнопки
+  «Модель» (список из кэша `/usr/local/bin/agy-models`, ставится на шаге 5)
+  и «Формат картинок»; выбор пишется в тот же
+  `~/.gemini/antigravity-skill.json`, который читает `gen.py`. Подкоманды
+  `/antigravity ask|image|reset`.
+- **Фото-референс** — фото с подписью в чате становится задачей про это фото
+  (PR `hermes#131`): файл скачивается в `workspace/.hermes-runs/refs/`, путь
+  идёт строкой «Референс-изображение: <путь>», codex передаёт его в
+  `--reference` (нужен gen.py с поддержкой `--reference` — PR `#12` этого
+  репозитория). Кнопка «Картинки» меню `/skills` ведёт в `antigravity_image`
+  (PR `hermes#130`).
 
 ## Шаг 8. Проверка
 
